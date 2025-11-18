@@ -24,6 +24,13 @@ from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
+# ---------------- config ----------------
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")  # Set to protect endpoints. If empty, endpoints are open.
+DEFAULT_INTERVAL = 60  # seconds
+
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("ping_api")
 # -------------------- Config --------------------
 DATA_DIR = os.getenv("DATA_DIR", "data")
 if not os.path.exists(DATA_DIR):
