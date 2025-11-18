@@ -278,18 +278,53 @@
       justify-content: center;
       gap: 8px;
       margin-top: 8px;
+      flex-wrap: wrap;
     }
-    .card-buttons a button {
-      padding: 8px 16px;
+    .card-buttons a button,
+    .card-buttons button {
+      padding: 8px 12px;
       border: none;
       border-radius: 4px;
       cursor: pointer;
       background: #4a00e0;
       color: #fff;
+      font-size: 0.9rem;
     }
-    .card-buttons a button:hover {
+    .card-buttons a button:hover,
+    .card-buttons button:hover {
       background: #00ff6a;
       color: #000;
+    }
+    .card-buttons button[disabled] {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    /* Video placeholder (lazy-load video) */
+    .video-placeholder {
+      position: relative;
+      cursor: pointer;
+      overflow: hidden;
+      border-radius: 6px;
+    }
+    .video-placeholder img.thumb {
+      width: 100%;
+      display: block;
+      border-radius: 6px;
+    }
+    .video-placeholder .btn-play {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      background: rgba(0,0,0,0.6);
+      border: none;
+      color: #fff;
+      font-size: 2rem;
+      padding: 12px 18px;
+      border-radius: 999px;
+      cursor: pointer;
+      box-shadow: 0 0 12px rgba(255,0,80,0.4);
     }
 
     /* Slideshow Modal */
@@ -462,6 +497,30 @@
       color: #ff004f;
       text-shadow: 0 0 8px #ff004f;
     }
+
+    /* small helper for the toggle */
+    .videos-controls {
+      display:flex;
+      justify-content:center;
+      gap:8px;
+      margin-bottom:12px;
+      align-items:center;
+    }
+    .videos-controls button {
+      padding:8px 12px;
+      border-radius:6px;
+      border:none;
+      cursor:pointer;
+      background:#222;
+      color:#fff;
+    }
+    .videos-controls button.active {
+      background:#4a00e0;
+      color:#fff;
+    }
+
+    /* hide images-only control when not applicable */
+    .videos-controls.hidden { display: none; }
   </style>
 </head>
 <body>
@@ -581,10 +640,22 @@
           {% elif view_type == 'top' %} Top Videos
           {% endif %}
         </h3>
-        <div class="grid">
+
+        <!-- Controls: default to "images only" per your request (stories) -->
+        <!-- We'll hide or show this block depending on view_type via JS -->
+        <div id="videos-controls" class="videos-controls" style="margin-bottom:12px;">
+          <button id="btn-images-only" class="active" title="Show only image/story posts on load">Stories (images)</button>
+          <button id="btn-show-all" title="Show videos too (lazy-loaded)">Show videos</button>
+          <div style="flex:1"></div>
+          <button id="btn-refresh" title="Refresh saved urls">Refresh</button>
+        </div>
+
+        <div class="grid" id="videos-grid">
           {% for v in user_videos %}
-            <div class="card">
-              {% if v.images and v.images|length > 0 %}
+            <div class="card" data-aweme="{{ v.aweme_id }}" data-hd="{{ hd_urls.get(v.aweme_id,'') }}">
+              {# If view_type is latest or top, DO NOT render image/story cards — always render video placeholder #}
+              {% if v.images and v.images|length > 0 and (view_type not in ['latest','top']) %}
+                <!-- image story card (only when not latest/top) -->
                 <img
                   src="{{ v.images[0] }}"
                   class="single-img"
@@ -592,11 +663,18 @@
                   data-index="0"
                   data-images='{{ v.images|tojson }}'
                 />
-                <audio controls src="{{ v.play_url }}"></audio>
+                {% if v.play_url %}
+                  <audio controls src="{{ v.play_url }}"></audio>
+                {% endif %}
               {% else %}
-                <video controls data-aweme-id="{{ v.aweme_id }}">
-                  <source src="{{ v.play_url }}" type="video/mp4">
-                </video>
+                <!-- render as video placeholder for latest/top OR when no images -->
+                <div class="video-placeholder"
+                     data-aweme-id="{{ v.aweme_id }}"
+                     data-play-url="{{ v.play_url }}"
+                     data-cover="{{ v.cover or '' }}">
+                  <img src="{{ v.cover or '/static/bop.png' }}" class="thumb" alt="thumb"/>
+                  <button class="btn-play" title="Load video">▶</button>
+                </div>
               {% endif %}
               <div class="title">{{ v.text or ("Video " ~ v.aweme_id) }}</div>
               <div class="views" id="views-{{ v.aweme_id }}">{{ v.play_count }} views</div>
@@ -653,6 +731,9 @@
   </div>
 
   <script>
+    // expose server-rendered view_type to JS
+    const VIEW_TYPE = "{{ view_type or '' }}";
+
     // Sidebar toggle & anti-copy
     document.getElementById('sidebar-toggle').onclick = () =>
       document.querySelector('.about-us').classList.toggle('open');
@@ -660,7 +741,7 @@
       document.addEventListener(e, ev => ev.preventDefault())
     );
 
-    // *** ANTI-CTRL+U WITH CUSTOM ERROR MESSAGE ***
+    // Anti-CTRL+U
     document.addEventListener('keydown', function(e) {
       if (e.ctrlKey && e.key.toLowerCase() === 'u') {
         e.preventDefault();
@@ -759,7 +840,7 @@
                 .forEach(b=>b.style.display='block');
       } else errEl.textContent='Wrong password';
     };
-    document.getElementById('admin-pass-cancel').onclick = () => modal.style.display='none';  
+    document.getElementById('admin-pass-cancel').onclick = () => modal.style.display='none';
 
     // delete-user & delete-url
     function bindDeleteUsers(){
@@ -807,19 +888,85 @@
       }
     };
 
-    // saveFetchedUserUrls
+    // saveFetchedUserUrls (BATCHED): collects all visible cards for the current query and posts a single array
     async function saveFetchedUserUrls() {
       const params = new URLSearchParams(location.search);
       const q = params.get('q');
       if (!q) return;
-      document.querySelectorAll('#page-videos .card').forEach(async card => {
-        const mediaEl = card.querySelector('audio, video');
-        const aweme_id = mediaEl.dataset.awemeId;
-        const play_url = mediaEl.tagName==='AUDIO' ? mediaEl.src : mediaEl.querySelector('source').src;
-        const buttons  = card.querySelectorAll('.card-buttons a');
-        const hd_url   = buttons[1]?.href || play_url;
-        await fetch('/api/saved-user-urls',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ username: q, aweme_id, play_url, hd_url, images: JSON.parse(card.querySelector('.single-img')?.dataset.images || '[]') })});
+
+      // fetch existing saved user urls to avoid duplicates
+      let existing = [];
+      try {
+        const er = await fetch('/api/saved-user-urls');
+        if (er.ok) existing = await er.json();
+      } catch (e) {
+        console.debug('Failed to fetch existing saved-user-urls', e);
+      }
+      const existingSet = new Set(existing.map(e => `${(e.username||'').toLowerCase()}|||${e.aweme_id}`));
+
+      const entries = [];
+      // iterate each card in videos-grid
+      document.querySelectorAll('#videos-grid .card').forEach(card => {
+        try {
+          const imgEl = card.querySelector('.single-img');
+          const placeholder = card.querySelector('.video-placeholder');
+          const aweme = card.dataset.aweme || (imgEl && (imgEl.dataset.awemeId||imgEl.dataset.awemeId)) || (placeholder && placeholder.dataset.awemeId);
+          if (!aweme) return;
+
+          const key = `${q.toLowerCase()}|||${aweme}`;
+          if (existingSet.has(key)) {
+            // skip already-saved entry
+            return;
+          }
+
+          let play_url = '';
+          let hd_url = card.dataset.hd || '';
+          let images = [];
+
+          if (imgEl) {
+            images = JSON.parse(imgEl.dataset.images || '[]');
+            const audio = card.querySelector('audio');
+            play_url = audio ? audio.src : (images.length ? images[0] : '');
+          } else if (placeholder) {
+            play_url = placeholder.dataset.playUrl || '';
+            images = [];
+          } else {
+            const vid = card.querySelector('video');
+            if (vid) {
+              const src = vid.querySelector('source') ? vid.querySelector('source').src : vid.src;
+              play_url = src || '';
+            }
+          }
+
+          entries.push({
+            username: q,
+            aweme_id: aweme,
+            play_url: play_url,
+            hd_url: hd_url,
+            images: images
+          });
+        } catch (err) {
+          console.debug('saveFetchedUserUrls skipped a card', err);
+        }
       });
+
+      if (!entries.length) return;
+
+      try {
+        // POST the array of entries in one request (server supports list payload)
+        const r = await fetch('/api/saved-user-urls', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(entries)
+        });
+        if (!r.ok) {
+          console.debug('Failed to save saved-user-urls batch', await r.text());
+        } else {
+          console.debug('Saved', entries.length, 'entries to saved-user-urls');
+        }
+      } catch (e) {
+        console.debug('Error posting saved-user-urls batch', e);
+      }
     }
 
     // NAV & VIEW SWITCHING
@@ -831,7 +978,9 @@
         a.classList.toggle('active', a.dataset.view===view)
       );
       ['home','urls','users','videos','saved-user','slideshow'].forEach(v=>{
-        document.getElementById('page-'+v).style.display =
+        const el = document.getElementById('page-'+v);
+        if (!el) return;
+        el.style.display =
           (v===view||(['latest','top'].includes(view)&&v==='videos'))?'block':'none';
       });
       if(view==='users'){
@@ -882,13 +1031,25 @@
 
     // Fetch & render saved users
     async function fetchSavedUsers(){
-      const [resUsers, resUrls] = await Promise.all([
+      const [resUsers, resUrls] = await Promise.allSettled([
         fetch('/api/saved-users'),
         fetch('/api/saved-user-urls')
       ]);
-      if (!resUsers.ok || !resUrls.ok) return;
-      const users = await resUsers.json();
-      const urls  = await resUrls.json();
+      if (resUsers.status !== 'fulfilled' || !resUsers.value.ok) return;
+      const users = await resUsers.value.json();
+      let urls = [];
+      if (resUrls.status === 'fulfilled' && resUrls.value.ok) {
+        urls = await resUrls.value.json();
+      } else {
+        try {
+          const r = await fetch('/api/saved-urls');
+          if (r.ok) {
+            const savedUrls = await r.json();
+            urls = savedUrls.map(s => ({ username: s.username || '', aweme_id: s.aweme_id, images: s.images || [], play_url: s.play_url }));
+          }
+        } catch(e){}
+      }
+
       const urlUsernames = new Set(urls.map(u => u.username));
       const seen = new Set();
       const filtered = users
@@ -910,7 +1071,7 @@
         const link = document.createElement('div');
         link.className='user-card';
         link.innerHTML = `
-          <img src="/static/bop.png" alt="${u.username}"/>
+          <img src="${u.avatar || '/static/bop.png'}" alt="${u.username}"/>
           <span class="handle">${u.username}</span>`;
         entry.appendChild(link);
 
@@ -937,8 +1098,8 @@
       const grid = document.getElementById('saved-user-grid');
       grid.innerHTML = '';
       const resp     = await fetch('/api/saved-user-urls'),
-            all      = await resp.json(),
-            userUrls = all.filter(item=>item.username===username);
+            all      = resp.ok ? await resp.json() : [];
+      const userUrls = all.filter(item=>item.username===username);
 
       if (userUrls.length){
         userUrls.forEach(v=>{
@@ -964,7 +1125,7 @@
             `;
           }
 
-          // ** add Download + HD buttons here too **
+          // Download + HD buttons
           c.innerHTML += `
             <div class="card-buttons">
               <a href="/download?video_id=${v.aweme_id}&hd=0" download><button>Download</button></a>
@@ -996,7 +1157,7 @@
       }
     }, true);
 
-    // *** CUSTOM CONTEXT MENU LOGIC ***
+    // CUSTOM CONTEXT MENU LOGIC
     const customMenu = document.getElementById('custom-menu');
     let currentTarget = null;
     document.addEventListener('contextmenu', e => {
@@ -1032,7 +1193,7 @@
 
     document.getElementById('menu-save').onclick = () => {
       customMenu.style.display = 'none';
-      const src = currentTarget.querySelector('source').src;
+      const src = currentTarget.querySelector('source') ? currentTarget.querySelector('source').src : currentTarget.src;
       const a = document.createElement('a');
       a.href = src;
       a.download = '';
@@ -1042,7 +1203,7 @@
     };
     document.getElementById('menu-open').onclick = () => {
       customMenu.style.display = 'none';
-      const src = currentTarget.querySelector('source').src;
+      const src = currentTarget.querySelector('source') ? currentTarget.querySelector('source').src : currentTarget.src;
       window.open(src, '_blank');
     };
     document.getElementById('menu-download-image').onclick = () => {
@@ -1056,7 +1217,7 @@
       document.body.removeChild(a);
     };
 
-    // Image slideshow
+    // Image slideshow (modal + api open)
     (function(){
       const imgModal = document.getElementById('image-modal');
       const modalImg = imgModal.querySelector('img');
@@ -1068,6 +1229,7 @@
       let currentIndex = 0;
 
       function showModal(){
+        if (!currentImages || !currentImages.length) return;
         imgModal.style.display = 'flex';
         modalImg.src = currentImages[currentIndex];
       }
@@ -1075,28 +1237,41 @@
         imgModal.style.display = 'none';
       }
       function showPrev(){
+        if (!currentImages.length) return;
         currentIndex = (currentIndex - 1 + currentImages.length) % currentImages.length;
         showModal();
       }
       function showNext(){
+        if (!currentImages.length) return;
         currentIndex = (currentIndex + 1) % currentImages.length;
         showModal();
       }
 
-      // bind click on the single image
+      // bind click on .single-img elements to open modal
       function bindSingleImages(){
         document.querySelectorAll('.single-img').forEach(img => {
           img.onclick = () => {
-            const arr = JSON.parse(img.dataset.images);
-            if (arr.length > 1) {
-              currentImages = arr;
-              currentIndex = 0;
-              showModal();
-            }
+            const arr = JSON.parse(img.dataset.images || '[]');
+            if (!arr.length) return;
+            currentImages = arr;
+            currentIndex = 0;
+            showModal();
           };
         });
       }
       bindSingleImages();
+
+      // expose openSlideshow(images, index)
+      window.openSlideshow = function(images, index){
+        try {
+          if (!Array.isArray(images) || !images.length) return;
+          currentImages = images;
+          currentIndex = (typeof index === 'number' && index >= 0) ? (index % images.length) : 0;
+          showModal();
+        } catch (e) {
+          console.debug('openSlideshow error', e);
+        }
+      };
 
       closeBtn.onclick = closeModal;
       prevBtn.onclick  = showPrev;
@@ -1114,47 +1289,189 @@
         if (e.target === imgModal) closeModal();
       };
 
-      // re-bind after dynamic content
       window.addEventListener('slideshowRendered', bindSingleImages);
     })();
 
-    // Slideshow functions
-    async function fetchSlides(){
-      const res = await fetch('/api/slideshow');
-      const all = await res.json();
-      const params = new URLSearchParams(location.search);
-      const q = params.get('q') || '';
-      let usernames = [];
-      if (q) usernames = q.split(',').map(u=>u.trim().toLowerCase()).filter(u=>u);
-      let filtered = all;
-      if (usernames.length) {
-        filtered = all.filter(item=>usernames.includes(item.username.toLowerCase()));
+    // Video placeholder -> create video element and lazy-load source
+    document.body.addEventListener('click', async (e) => {
+      const target = e.target.closest('.video-placeholder');
+      if (!target) return;
+      if (target.dataset.loading === '1') return;
+      target.dataset.loading = '1';
+      const playUrl = target.dataset.playUrl;
+      const awemeId = target.dataset.awemeId;
+      const video = document.createElement('video');
+      video.controls = true;
+      video.setAttribute('playsinline', '');
+      video.dataset.awemeId = awemeId;
+      const src = document.createElement('source');
+      src.src = playUrl;
+      src.type = 'video/mp4';
+      video.appendChild(src);
+      target.innerHTML = '';
+      target.appendChild(video);
+      try { await video.play(); } catch (err) {}
+    });
+
+    // Utility: grouping helper for slides (same as previous version) - kept for slideshow page
+    function groupSlidesFromArray(arr){
+      const map = new Map();
+      function pushToMap(username, aweme_id, img, play_url, hd_url){
+        if (!username) username = '';
+        const key = `${username.toLowerCase()}|||${aweme_id||''}`;
+        if (!map.has(key)){
+          map.set(key, { username: username, aweme_id: aweme_id, images: [], play_url: play_url||'', hd_url: hd_url||'' });
+        }
+        const entry = map.get(key);
+        if (play_url) entry.play_url = entry.play_url || play_url;
+        if (hd_url) entry.hd_url = entry.hd_url || hd_url;
+        if (img && !entry.images.includes(img)) entry.images.push(img);
       }
-      renderSlides(filtered);
+
+      for (const it of (arr||[])){
+        try {
+          if (Array.isArray(it.images) && it.images.length > 0) {
+            const username = it.username || it.user || '';
+            const aweme = it.aweme_id || it.aweme || it.id || '';
+            const play = it.play_url || it.play || it.url || '';
+            const hd = it.hd_url || it.hd || '';
+            for (const im of it.images) pushToMap(username, aweme, im, play, hd);
+            continue;
+          }
+          if (it.image_url || it.image) {
+            const username = it.username || it.user || '';
+            const aweme = it.aweme_id || it.aweme || it.id || '';
+            const img = it.image_url || it.image || '';
+            const play = it.play_url || it.play || '';
+            const hd = it.hd_url || it.hd || '';
+            if (img) pushToMap(username, aweme, img, play, hd);
+            continue;
+          }
+          if (it.username && it.aweme_id && Array.isArray(it.images)) {
+            for (const im of it.images || []) pushToMap(it.username, it.aweme_id, im, it.play_url, it.hd_url);
+            continue;
+          }
+          const username = it.username || it.user || (it.data && it.data.username) || '';
+          const aweme = it.aweme_id || it.aweme || (it.data && it.data.aweme_id) || '';
+          const imgs = it.images || (it.data && it.data.images) || [];
+          if (Array.isArray(imgs) && imgs.length){
+            for (const im of imgs) pushToMap(username, aweme, im, it.play_url, it.hd_url);
+            continue;
+          }
+          const play = it.play_url || it.play || (it.data && it.data.play_url) || '';
+          if (play){
+            pushToMap(username, aweme, '', play, it.hd_url || '');
+          }
+        } catch (e){
+          console.debug('groupSlidesFromArray error', e, it);
+        }
+      }
+
+      return Array.from(map.values()).map(v=>{
+        if ((!v.images || !v.images.length) && v.play_url) {
+          v.images = [v.play_url];
+        }
+        return v;
+      });
+    }
+
+    // Slideshow functions (kept unchanged from previous robust version)
+    async function fetchSlides(){
+      try {
+        const res = await fetch('/api/slideshow');
+        if (res.ok) {
+          const j = await res.json();
+          let slides = groupSlidesFromArray(j);
+          if (!slides.length) {
+            slides = await trySavedUserUrlsFallback();
+          }
+          renderSlides(slides);
+          window.dispatchEvent(new Event('slideshowRendered'));
+          return;
+        }
+      } catch (e) {
+        console.debug('fetch /api/slideshow failed', e);
+      }
+      const fallback = await trySavedUserUrlsFallback();
+      renderSlides(fallback);
       window.dispatchEvent(new Event('slideshowRendered'));
+    }
+
+    async function trySavedUserUrlsFallback(){
+      try {
+        const r = await fetch('/api/saved-user-urls');
+        if (r.ok) {
+          const all = await r.json();
+          return groupSlidesFromArray(all);
+        }
+      } catch (e){ console.debug('saved-user-urls fallback error', e); }
+      try {
+        const r2 = await fetch('/api/saved-urls');
+        if (r2.ok) {
+          const all2 = await r2.json();
+          return groupSlidesFromArray(all2);
+        }
+      } catch (e) { console.debug('saved-urls fallback error', e); }
+      return [];
     }
 
     function renderSlides(entries){
       const grid = document.getElementById('slideshow-grid');
       grid.innerHTML = '';
+      if (!entries || !entries.length) {
+        grid.innerHTML = '<p style="color:#aaa; text-align:center;">No slideshows found.</p>';
+        return;
+      }
       entries.forEach(v => {
-        // v: { username, aweme_id, image_url }
         const card = document.createElement('div');
         card.className = 'card';
-
+        const thumbUrl = (v.images && v.images.length && v.images[0]) ? v.images[0] : (v.play_url || '/static/bop.png');
         const img = document.createElement('img');
-        img.src = v.image_url;
+        img.src = thumbUrl;
         img.className = 'single-img';
-        // wrap single image in array for modal structure
-        img.dataset.images = JSON.stringify([v.image_url]);
-        img.dataset.awemeId = v.aweme_id;
+        img.alt = `${v.username} ${v.aweme_id}`;
+        img.dataset.images = JSON.stringify(v.images || []);
+        img.dataset.awemeId = v.aweme_id || '';
+        img.dataset.username = v.username || '';
         card.appendChild(img);
-
         const info = document.createElement('div');
         info.className = 'title';
         info.textContent = `${v.username} • ${v.aweme_id}`;
         card.appendChild(info);
-
+        const btns = document.createElement('div');
+        btns.className = 'card-buttons';
+        const dlAnchor = document.createElement('a');
+        dlAnchor.href = v.play_url || '#';
+        if (v.play_url) dlAnchor.setAttribute('download', '');
+        const dlBtn = document.createElement('button');
+        dlBtn.textContent = 'Download';
+        if (!v.play_url) dlBtn.disabled = true;
+        dlAnchor.appendChild(dlBtn);
+        btns.appendChild(dlAnchor);
+        const hdAnchor = document.createElement('a');
+        hdAnchor.href = v.hd_url || '#';
+        if (v.hd_url) hdAnchor.setAttribute('download', '');
+        const hdBtn = document.createElement('button');
+        hdBtn.textContent = 'HD';
+        if (!v.hd_url) hdBtn.disabled = true;
+        hdAnchor.appendChild(hdBtn);
+        btns.appendChild(hdAnchor);
+        const viewBtn = document.createElement('button');
+        viewBtn.textContent = 'View';
+        viewBtn.onclick = () => {
+          const imgs = JSON.parse(img.dataset.images || '[]');
+          if (!imgs || !imgs.length) {
+            alert('No images in this slideshow');
+            return;
+          }
+          if (window.openSlideshow) {
+            window.openSlideshow(imgs, 0);
+          } else {
+            img.click();
+          }
+        };
+        btns.appendChild(viewBtn);
+        card.appendChild(btns);
         grid.appendChild(card);
       });
     }
@@ -1170,27 +1487,67 @@
       fetchSlides();
     };
 
+    // fetch saved-user-urls and saved-urls when refresh button clicked
+    document.getElementById('btn-refresh').onclick = async () => {
+      await fetchSavedUrls();
+      await saveFetchedUserUrls(); // batched save
+      alert('Refreshed saved URLs / saved user-urls.');
+    };
+
+    // toggle between images-only (stories) and show-all (include videos)
+    const btnImagesOnly = document.getElementById('btn-images-only');
+    const btnShowAll = document.getElementById('btn-show-all');
+    const videosControls = document.getElementById('videos-controls');
+
+    function setImagesOnlyMode(on) {
+      btnImagesOnly.classList.toggle('active', on);
+      btnShowAll.classList.toggle('active', !on);
+      document.querySelectorAll('#videos-grid .card').forEach(card => {
+        const hasImg = !!card.querySelector('.single-img');
+        if (on) {
+          card.style.display = hasImg ? '' : 'none';
+        } else {
+          card.style.display = '';
+        }
+      });
+    }
+
+    btnImagesOnly.onclick = () => setImagesOnlyMode(true);
+    btnShowAll.onclick = () => setImagesOnlyMode(false);
+
     // init
     async function initApp(){
       highlightNav();
       await fetchSavedUrls();
-      await saveFetchedUserUrls();
+      await saveFetchedUserUrls(); // batched save at load
       await fetchSlides();
+
+      // If we're on latest or top, hide the images-only control and default to videos (no stories)
+      if (VIEW_TYPE === 'latest' || VIEW_TYPE === 'top') {
+        videosControls.classList.add('hidden');
+        setImagesOnlyMode(false);
+      } else {
+        videosControls.classList.remove('hidden');
+        // default: images-only (stories) mode ON
+        setImagesOnlyMode(true);
+      }
+
+      window.dispatchEvent(new Event('slideshowRendered'));
     }
+
     window.addEventListener('load', async ()=>{
       document.getElementById('loader').classList.add('fade-out');
       setTimeout(async ()=>{
         document.getElementById('loader').style.display='none';
+        initAuth();
         const token = localStorage.getItem('tikify_token');
         if (token){
           document.getElementById('auth-container').style.display='none';
           document.getElementById('app-content').style.display='block';
-          initAuth();
           await initApp();
         } else {
           document.getElementById('app-content').style.display='none';
           document.getElementById('auth-container').style.display='flex';
-          initAuth();
         }
       },600);
     });
