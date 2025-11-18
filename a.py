@@ -11,7 +11,9 @@ import psycopg2.extras
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from urllib.parse import urlparse
-
+from fastapi import FastAPI, HTTPException, Request, status, BackgroundTasks
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, HttpUrl, Field
 from jose import jwt
 from passlib.context import CryptContext
 
@@ -966,6 +968,213 @@ async def get_images_by_video(video_id: str):
     except Exception:
         imgs = []
     return JSONResponse({"aweme_id": video_id, "images": imgs})
+
+# ---------------- internal task store ----------------
+# Stores metadata and the asyncio.Task (so we can cancel)
+class PingerMeta(BaseModel):
+    name: str
+    url: str
+    interval: int
+    started_at: str
+    last_ping_at: Optional[str] = None
+    runs: int = 0
+    max_runs: Optional[int] = None
+    status: str = "running"  # running, stopped, error
+    last_status_code: Optional[int] = None
+    last_error: Optional[str] = None
+
+# in-memory store: name -> {"meta": PingerMeta, "task": asyncio.Task}
+PINGERS: Dict[str, Dict[str, Any]] = {}
+PINGERS_LOCK = asyncio.Lock()
+
+# ---------------- request models ----------------
+class StartPingIn(BaseModel):
+    url: HttpUrl
+    name: Optional[str] = Field(None, description="Optional name for the pinger. If omitted a name is generated.")
+    interval: Optional[int] = Field(DEFAULT_INTERVAL, gt=0, description="Interval in seconds between pings")
+    max_runs: Optional[int] = Field(None, gt=0, description="Optional max number of pings (then stops)")
+
+class StopPingIn(BaseModel):
+    name: str
+
+# ---------------- helpers ----------------
+def check_admin_token(request: Request):
+    if ADMIN_TOKEN:
+        token = request.headers.get("X-Admin-Token", "")
+        if not token or token != ADMIN_TOKEN:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid admin token")
+
+async def safe_sleep(seconds: float):
+    # helper wrapper that's cancellable
+    await asyncio.sleep(seconds)
+
+async def pinger_loop(name: str, url: str, interval: int, max_runs: Optional[int]):
+    """
+    Background loop that pings `url` every `interval` seconds.
+    Updates PINGERS[name]['meta'] as it runs.
+    """
+    meta: PingerMeta = PINGERS[name]["meta"]
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            while True:
+                # If someone asked to stop or task cancelled, break
+                if PINGERS.get(name) is None:
+                    log.info("Pinger %s requested stop (entry removed)", name)
+                    break
+
+                # perform request
+                start_ts = datetime.utcnow().isoformat() + "Z"
+                try:
+                    resp = await client.get(url)
+                    status_code = resp.status_code
+                    body_preview = None
+                    # don't store body, but optionally log small preview on non-200
+                    if status_code >= 400:
+                        log.warning("Pinger %s got status %s for %s", name, status_code, url)
+                    # update meta under lock
+                    async with PINGERS_LOCK:
+                        m: PingerMeta = PINGERS[name]["meta"]
+                        m.last_ping_at = start_ts
+                        m.runs += 1
+                        m.last_status_code = status_code
+                        m.last_error = None
+                except asyncio.CancelledError:
+                    log.info("Pinger %s cancelled during request", name)
+                    break
+                except Exception as e:
+                    log.exception("Pinger %s error while pinging %s", name, url)
+                    async with PINGERS_LOCK:
+                        if name in PINGERS:
+                            m: PingerMeta = PINGERS[name]["meta"]
+                            m.last_ping_at = start_ts
+                            m.runs += 1
+                            m.last_status_code = None
+                            m.last_error = repr(e)
+                            m.status = "error"
+                # check stopping conditions
+                async with PINGERS_LOCK:
+                    if name not in PINGERS:
+                        log.info("Pinger %s removed; exiting loop", name)
+                        break
+                    m: PingerMeta = PINGERS[name]["meta"]
+                    if m.max_runs and m.runs >= m.max_runs:
+                        m.status = "stopped"
+                        # cancel and remove after loop
+                        log.info("Pinger %s reached max_runs (%s), stopping", name, m.max_runs)
+                        break
+                # sleep for interval (allow cancellation)
+                try:
+                    await safe_sleep(interval)
+                except asyncio.CancelledError:
+                    log.info("Pinger %s cancelled during sleep", name)
+                    break
+        finally:
+            # cleanup: if still in store, mark stopped (but do not remove automatically)
+            async with PINGERS_LOCK:
+                if name in PINGERS:
+                    PINGERS[name]["meta"].status = PINGERS[name]["meta"].status or "stopped"
+            log.info("Pinger %s loop exited", name)
+
+# ---------------- API routes ----------------
+@app.post("/api/ping/start")
+async def api_ping_start(payload: StartPingIn, request: Request):
+    """
+    Start a named pinger. JSON body:
+    {
+      "url": "https://example.com/",
+      "name": "mykeep",
+      "interval": 60,
+      "max_runs": 100
+    }
+    If name omitted, a name will be generated like keep-<timestamp>.
+    Protected by X-Admin-Token header if ADMIN_TOKEN env var is set.
+    """
+    check_admin_token(request)
+
+    # basic validation
+    name = payload.name or f"keep-{int(datetime.utcnow().timestamp())}"
+    name = name.strip()
+    interval = int(payload.interval or DEFAULT_INTERVAL)
+    max_runs = int(payload.max_runs) if payload.max_runs is not None else None
+    url = str(payload.url)
+
+    async with PINGERS_LOCK:
+        if name in PINGERS:
+            raise HTTPException(status_code=409, detail=f"Pinger with name '{name}' already exists")
+        # create meta and task
+        meta = PingerMeta(
+            name=name,
+            url=url,
+            interval=interval,
+            started_at=datetime.utcnow().isoformat() + "Z",
+            max_runs=max_runs
+        )
+        # create task and store
+        task = asyncio.create_task(pinger_loop(name=name, url=url, interval=interval, max_runs=max_runs))
+        PINGERS[name] = {"meta": meta, "task": task}
+
+    log.info("Started pinger '%s' -> %s every %ss", name, url, interval)
+    return JSONResponse({"ok": True, "name": name, "url": url, "interval": interval, "max_runs": max_runs})
+
+@app.post("/api/ping/stop")
+async def api_ping_stop(payload: StopPingIn, request: Request):
+    """
+    Stop a running pinger by name. This cancels the background task and removes it
+    from the in-memory store.
+    """
+    check_admin_token(request)
+    name = payload.name.strip()
+    async with PINGERS_LOCK:
+        if name not in PINGERS:
+            raise HTTPException(status_code=404, detail=f"No pinger named '{name}'")
+        entry = PINGERS.pop(name)
+        task: asyncio.Task = entry.get("task")
+        # cancel the task
+        if task and not task.done():
+            task.cancel()
+        # try to await briefly to allow cancellation
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+        except Exception:
+            # it's fine if the task didn't exit yet
+            pass
+    log.info("Stopped and removed pinger '%s'", name)
+    return JSONResponse({"ok": True, "name": name})
+
+@app.get("/api/ping/status")
+async def api_ping_status(request: Request):
+    """
+    Returns current pingers metadata (no tasks returned).
+    """
+    check_admin_token(request)
+    async with PINGERS_LOCK:
+        out = {name: PINGERS[name]["meta"].dict() for name in PINGERS}
+    return JSONResponse(out)
+
+# Optional: small route that returns health of the control API
+@app.get("/api/ping/health")
+async def api_ping_health():
+    return {"status": "ok", "active_pingers": len(PINGERS)}
+
+# ---------------- graceful shutdown ----------------
+@app.on_event("shutdown")
+async def shutdown_event():
+    log.info("Shutdown event: cancelling %d pinger(s)", len(PINGERS))
+    async with PINGERS_LOCK:
+        names = list(PINGERS.keys())
+    for name in names:
+        async with PINGERS_LOCK:
+            entry = PINGERS.pop(name, None)
+        if entry:
+            task = entry.get("task")
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+                except Exception:
+                    pass
+    log.info("All pingers cancelled on shutdown")
+
 
 @app.get("/ping")
 async def ping():
