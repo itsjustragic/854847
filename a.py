@@ -42,7 +42,7 @@ SAVED_USER_URLS_FILE = os.path.join(DATA_DIR, "saved_user_urls.json")
 
 # Headers & defaults
 WEB_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; SnapStoryDL/1.0)",
+    "User-Agent": "Mozilla/5.0 (compatible; BopCentral/1.0)",
     "Accept-Encoding": "identity"
 }
 DEFAULT_AVATAR = (
