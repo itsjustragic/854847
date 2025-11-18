@@ -68,7 +68,9 @@ HD_URLS: Dict[str, str] = {}
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # Password hashing
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# <-- CHANGED: use pbkdf2_sha256 as primary scheme so passwords of any length are allowed.
+# bcrypt remains in the list so existing bcrypt hashes still verify.
+pwd_context = CryptContext(schemes=["pbkdf2_sha256", "bcrypt"], deprecated="auto")
 
 # FastAPI
 app = FastAPI()
@@ -1083,20 +1085,9 @@ async def pinger_loop(name: str, url: str, interval: int, max_runs: Optional[int
                     PINGERS[name]["meta"].status = PINGERS[name]["meta"].status or "stopped"
             log.info("Pinger %s loop exited", name)
 
-# ---------------- API routes ----------------
+# ---------------- API routes (ping control) ----------------
 @app.post("/api/ping/start")
 async def api_ping_start(payload: StartPingIn, request: Request):
-    """
-    Start a named pinger. JSON body:
-    {
-      "url": "https://example.com/",
-      "name": "mykeep",
-      "interval": 60,
-      "max_runs": 100
-    }
-    If name omitted, a name will be generated like keep-<timestamp>.
-    Protected by X-Admin-Token header if ADMIN_TOKEN env var is set.
-    """
     check_admin_token(request)
 
     # basic validation
@@ -1126,10 +1117,6 @@ async def api_ping_start(payload: StartPingIn, request: Request):
 
 @app.post("/api/ping/stop")
 async def api_ping_stop(payload: StopPingIn, request: Request):
-    """
-    Stop a running pinger by name. This cancels the background task and removes it
-    from the in-memory store.
-    """
     check_admin_token(request)
     name = payload.name.strip()
     async with PINGERS_LOCK:
@@ -1151,15 +1138,11 @@ async def api_ping_stop(payload: StopPingIn, request: Request):
 
 @app.get("/api/ping/status")
 async def api_ping_status(request: Request):
-    """
-    Returns current pingers metadata (no tasks returned).
-    """
     check_admin_token(request)
     async with PINGERS_LOCK:
         out = {name: PINGERS[name]["meta"].dict() for name in PINGERS}
     return JSONResponse(out)
 
-# Optional: small route that returns health of the control API
 @app.get("/api/ping/health")
 async def api_ping_health():
     return {"status": "ok", "active_pingers": len(PINGERS)}
@@ -1182,7 +1165,6 @@ async def shutdown_event():
                 except Exception:
                     pass
     log.info("All pingers cancelled on shutdown")
-
 
 @app.get("/ping")
 async def ping():
