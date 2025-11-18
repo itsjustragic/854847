@@ -8,3 +8,4 @@ python-multipart
 python-jose
 httpx
 router
+psycopg2
