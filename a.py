@@ -513,6 +513,106 @@ def fetch_user_posts_tikwm(username: str, max_items: int = 100, per_page: int = 
             break
     return normalized[:max_items]
 
+# --- Add these routes somewhere after your other /api routes (e.g. after /api/saved-urls) ---
+
+from fastapi import Body, Query
+
+@app.get("/api/saved-user-urls")
+async def api_get_saved_user_urls():
+    """
+    Return the raw list of saved_user_urls entries (DB or file fallback).
+    Frontend expects an array of objects: {username, aweme_id, play_url, hd_url, images}
+    """
+    try:
+        return JSONResponse(load_saved_user_urls())
+    except Exception as e:
+        logging.exception("GET /api/saved-user-urls failed")
+        raise HTTPException(status_code=500, detail="Failed to load saved user urls")
+
+@app.post("/api/saved-user-urls", status_code=201)
+async def api_post_saved_user_urls(payload: list[dict] = Body(...)):
+    """
+    Accept either a list of saved-user-url objects or a single object.
+    The frontend sends a LIST (batched). We:
+      - dedupe by (username.lower(), aweme_id)
+      - merge images and prefer non-empty play/hd urls
+      - insert new grouped entries at the front (preserve existing ones)
+    """
+    if not isinstance(payload, list):
+        payload = [payload]
+
+    saved = load_saved_user_urls()  # list of dicts
+    # build quick lookup for existing entries by (username_lower, aweme_id)
+    existing_lookup = {}
+    for i, e in enumerate(saved):
+        key = ( (e.get("username") or "").lower(), str(e.get("aweme_id") or "") )
+        # prefer earliest index (front items have lower i because we use insert(0) elsewhere)
+        if key not in existing_lookup:
+            existing_lookup[key] = i
+
+    inserted = 0
+    for item in payload:
+        uname = item.get("username") or ""
+        aid = str(item.get("aweme_id") or "")
+        key = (uname.lower(), aid)
+
+        if key in existing_lookup:
+            # merge into the existing entry
+            idx = existing_lookup[key]
+            entry = saved[idx]
+            # merge images (preserve order, avoid dupes)
+            existing_imgs = list(entry.get("images") or [])
+            for img in (item.get("images") or []):
+                if img and img not in existing_imgs:
+                    existing_imgs.append(img)
+            entry["images"] = existing_imgs
+
+            # prefer non-empty play/hd urls from the incoming item
+            if item.get("play_url"):
+                entry["play_url"] = item.get("play_url")
+            if item.get("hd_url"):
+                entry["hd_url"] = item.get("hd_url")
+            # update saved list in memory
+            saved[idx] = entry
+        else:
+            # create new entry and insert at front
+            new_entry = {
+                "username": uname,
+                "aweme_id": aid,
+                "play_url": item.get("play_url") or "",
+                "hd_url": item.get("hd_url") or "",
+                "images": list(item.get("images") or [])
+            }
+            saved.insert(0, new_entry)
+            # update lookup (new entry at index 0)
+            # shift existing indices in lookup by +1
+            existing_lookup = {k: (v + 1) for k, v in existing_lookup.items()}
+            existing_lookup[key] = 0
+            inserted += 1
+
+    try:
+        save_saved_user_urls(saved)
+    except Exception:
+        logging.exception("Failed saving saved-user-urls after POST")
+        raise HTTPException(status_code=500, detail="Failed to persist saved_user_urls")
+
+    return JSONResponse({"inserted": inserted, "total": len(saved)})
+
+@app.delete("/api/saved-user-urls/{aweme_id}", status_code=204)
+async def api_delete_saved_user_urls(aweme_id: str, username: Optional[str] = Query(None)):
+    """
+    Delete saved_user_urls entries by aweme_id and optional username.
+    Mirrors the behavior your frontend might use for cleanup.
+    """
+    saved = load_saved_user_urls()
+    if username:
+        saved = [e for e in saved if not (str(e.get("aweme_id")) == str(aweme_id) and (e.get("username") or "").lower() == username.lower())]
+    else:
+        saved = [e for e in saved if str(e.get("aweme_id")) != str(aweme_id)]
+    save_saved_user_urls(saved)
+    return JSONResponse(status_code=204, content={})
+
+
 # -------------------- App startup: init DB --------------------
 @app.on_event("startup")
 async def startup_event():
