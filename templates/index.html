@@ -680,7 +680,8 @@
               <div class="views" id="views-{{ v.aweme_id }}">{{ v.play_count }} views</div>
               <div class="card-buttons">
                 <a href="/download?video_id={{ v.aweme_id }}&hd=0" download><button>Download</button></a>
-                <a href="/download?video_id={{ v.aweme_id }}&hd=1" download><button>HD</button></a>
+                <!-- HD button now uses JS that invokes server submit task -->
+                <button class="hd-trigger" data-aweme="{{ v.aweme_id }}">HD</button>
               </div>
             </div>
           {% endfor %}
@@ -1019,7 +1020,7 @@
           </div>
           <div class="card-buttons">
             <a href="/download?video_id=${v.aweme_id}&hd=0" download><button>Download</button></a>
-            <a href="/download?video_id=${v.aweme_id}&hd=1" download><button>HD</button></a>
+            <button class="hd-trigger" data-aweme="${v.aweme_id}">HD</button>
           </div>
           <button class="delete-url" data-aweme="${v.aweme_id}">
             Delete
@@ -1129,7 +1130,7 @@
           c.innerHTML += `
             <div class="card-buttons">
               <a href="/download?video_id=${v.aweme_id}&hd=0" download><button>Download</button></a>
-              <a href="/download?video_id=${v.aweme_id}&hd=1" download><button>HD</button></a>
+              <button class="hd-trigger" data-aweme="${v.aweme_id}" ${v.hd_url ? `data-hd="${v.hd_url}"` : ''}>HD</button>
             </div>
           `;
 
@@ -1448,14 +1449,16 @@
         if (!v.play_url) dlBtn.disabled = true;
         dlAnchor.appendChild(dlBtn);
         btns.appendChild(dlAnchor);
-        const hdAnchor = document.createElement('a');
-        hdAnchor.href = v.hd_url || '#';
-        if (v.hd_url) hdAnchor.setAttribute('download', '');
+
+        // HD: render as button that will either use pre-existing HD url (data-hd) or call server submit
         const hdBtn = document.createElement('button');
         hdBtn.textContent = 'HD';
-        if (!v.hd_url) hdBtn.disabled = true;
-        hdAnchor.appendChild(hdBtn);
-        btns.appendChild(hdAnchor);
+        hdBtn.className = 'hd-trigger';
+        hdBtn.dataset.aweme = v.aweme_id || '';
+        if (v.hd_url) hdBtn.dataset.hd = v.hd_url;
+        if (!v.hd_url && !v.play_url) hdBtn.disabled = true;
+        btns.appendChild(hdBtn);
+
         const viewBtn = document.createElement('button');
         viewBtn.textContent = 'View';
         viewBtn.onclick = () => {
@@ -1514,6 +1517,83 @@
 
     btnImagesOnly.onclick = () => setImagesOnlyMode(true);
     btnShowAll.onclick = () => setImagesOnlyMode(false);
+
+    // -------- HD handling logic (uses server submit task via /api/from-url) --------
+    async function handleHdAction(button) {
+      if (!button || button.disabled) return;
+      const aweme = button.dataset.aweme;
+      if (!aweme) {
+        alert('Missing aweme id');
+        return;
+      }
+
+      // If the button already contains a ready HD url, download immediately.
+      if (button.dataset.hd) {
+        triggerDownload(button.dataset.hd);
+        return;
+      }
+
+      // Provide immediate UI feedback
+      const origText = button.textContent;
+      button.disabled = true;
+      button.textContent = 'Preparing HD…';
+
+      try {
+        // Construct TikTok URL — server /api/from-url will run submit_tikwm_task and persist hd if possible
+        const tUrl = `https://www.tiktok.com/video/${encodeURIComponent(aweme)}`;
+        const res = await fetch('/api/from-url', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({url: tUrl})
+        });
+
+        if (!res.ok) {
+          // fallback to download endpoint (server may attempt submit there as well)
+          console.debug('from-url returned non-ok; falling back to /download');
+          window.open(`/download?video_id=${encodeURIComponent(aweme)}&hd=1`, '_blank');
+          return;
+        }
+
+        const body = await res.json();
+        // prefer hd_url from server response, then play_url, else fallback to /download
+        const hd = body.hd_url || body.play_url || '';
+        if (hd) {
+          triggerDownload(hd);
+          return;
+        } else {
+          console.debug('from-url returned no hd/play url; fallback to /download');
+          window.open(`/download?video_id=${encodeURIComponent(aweme)}&hd=1`, '_blank');
+          return;
+        }
+      } catch (e) {
+        console.debug('handleHdAction error', e);
+        window.open(`/download?video_id=${encodeURIComponent(aweme)}&hd=1`, '_blank');
+        return;
+      } finally {
+        button.disabled = false;
+        button.textContent = origText;
+      }
+    }
+
+    function triggerDownload(url) {
+      if (!url) return;
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = '';
+      // ensure anchor is in DOM so some browsers respect download
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    }
+
+    // Global delegation for HD triggers
+    document.addEventListener('click', (e) => {
+      const hdBtn = e.target.closest('.hd-trigger');
+      if (hdBtn) {
+        e.preventDefault();
+        handleHdAction(hdBtn);
+      }
+    });
 
     // init
     async function initApp(){
