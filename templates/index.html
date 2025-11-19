@@ -878,16 +878,72 @@
       });
     }
 
-    // helper to download a remote URL as a file using fetch -> blob
+    // infer extension from MIME type or URL
+    function extFromMime(mime) {
+      if (!mime) return '';
+      if (mime.includes('jpeg')) return 'jpg';
+      if (mime.includes('png')) return 'png';
+      if (mime.includes('gif')) return 'gif';
+      if (mime.includes('webp')) return 'webp';
+      if (mime.includes('svg')) return 'svg';
+      if (mime.includes('bmp')) return 'bmp';
+      // fallback: take substring after '/'
+      const parts = mime.split('/');
+      if (parts.length>1) return parts[1].split(';')[0].slice(0,6);
+      return '';
+    }
+    function extFromUrl(url) {
+      try {
+        const u = decodeURIComponent((url || '').split('?')[0].split('#')[0]);
+        const last = u.split('/').pop() || '';
+        const m = last.match(/\.([A-Za-z0-9]{1,8})$/);
+        if (m) return m[1].toLowerCase();
+      } catch(e){}
+      return '';
+    }
+    function ensureFilenameHasExt(name, ext) {
+      if (!name) return `file.${ext || 'jpg'}`;
+      if (/\.[A-Za-z0-9]{1,8}$/.test(name)) return name;
+      return `${name}.${ext || 'jpg'}`;
+    }
+    function sanitizeFilename(name) {
+      return (name || '').replace(/[\/\\:?<>|"]/g, '_').slice(0,200);
+    }
+
+    // helper to build a sensible filename from URL/metadata
+    function makeFilenameFrom(url, base) {
+      const extMime = extFromUrl(url) || '';
+      let ext = extMime || '';
+      if (!ext) {
+        // can't infer ext from url — default to jpg and let blob/mime logic fix later
+        ext = 'jpg';
+      }
+      const baseName = sanitizeFilename(base || (url ? url.split('/').pop().split('?')[0] : 'image'));
+      return ensureFilenameHasExt(baseName, ext);
+    }
+
+    // helper to download a remote URL as a file using fetch -> blob (ensures proper extension)
     async function downloadUrlAsFile(url, suggestedName) {
       try {
         const res = await fetch(url, {mode: 'cors'});
         if (!res.ok) throw new Error('Network response not ok: ' + res.status);
         const blob = await res.blob();
+        const mime = blob.type || '';
+        let ext = extFromMime(mime) || extFromUrl(url) || 'jpg';
+        // if suggestedName provided but has no ext, append ext
+        let name = suggestedName || '';
+        if (!name) {
+          // create a name using the last part of url or timestamp
+          const guess = (url ? url.split('/').pop().split('?')[0] : '') || `image_${Date.now()}`;
+          name = guess;
+        }
+        // sanitize and ensure extension
+        name = sanitizeFilename(name);
+        if (!(/\.[A-Za-z0-9]{1,8}$/.test(name))) name = `${name}.${ext}`;
         const blobUrl = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = blobUrl;
-        a.download = suggestedName || '';
+        a.download = name;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -902,10 +958,14 @@
     // fallback simple downloader (may open in new tab if cross-origin prevents download)
     function fallbackDirectDownload(url, suggestedName) {
       try {
+        const ext = extFromUrl(url) || 'jpg';
+        let name = suggestedName || url.split('/').pop().split('?')[0] || `image_${Date.now()}.${ext}`;
+        name = sanitizeFilename(name);
+        if (!(/\.[A-Za-z0-9]{1,8}$/.test(name))) name = `${name}.${ext}`;
         const a = document.createElement('a');
         a.href = url;
-        if (suggestedName) a.download = suggestedName;
-        a.target = '_blank';
+        a.download = name;
+        // some browsers ignore download for cross-origin; open in new tab as last resort
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -1208,10 +1268,12 @@
             const btns = document.createElement('div');
             btns.className = 'card-buttons';
 
-            // single-image download (first image)
+            // single-image download (first image) - set explicit filename with ext
             const dlAnchor = document.createElement('a');
             dlAnchor.href = v.images[0];
-            dlAnchor.setAttribute('download', '');
+            const ext = extFromUrl(v.images[0]) || 'jpg';
+            const name = sanitizeFilename(`${username || v.aweme_id || 'image'}_1.${ext}`);
+            dlAnchor.setAttribute('download', name);
             const dlBtn = document.createElement('button');
             dlBtn.textContent = 'Download';
             dlAnchor.appendChild(dlBtn);
@@ -1336,8 +1398,10 @@
     document.getElementById('menu-download-image').onclick = async () => {
       customMenu.style.display = 'none';
       const src = currentTarget.src;
-      // Try blob download first
-      const suggested = (currentTarget.dataset && currentTarget.dataset.awemeId) ? `${currentTarget.dataset.awemeId}.jpg` : '';
+      const username = currentTarget.dataset.username || '';
+      const aweme = currentTarget.dataset.awemeId || '';
+      const ext = extFromUrl(src) || 'jpg';
+      const suggested = sanitizeFilename(`${username || aweme || 'image'}.${ext}`);
       const ok = await downloadUrlAsFile(src, suggested);
       if (!ok) fallbackDirectDownload(src, suggested);
     };
@@ -1414,13 +1478,11 @@
         if (!src) { alert('No image to download'); return; }
         const username = imgModal.dataset.username || '';
         const aweme = imgModal.dataset.aweme || '';
-        // build suggested filename
-        const ext = (src.split('.').pop().split(/\#|\?/)[0] || 'jpg').substr(0,6);
-        const suggested = `${username || aweme || 'image'}_${currentIndex + 1}.${ext}`;
+        // determine extension from URL first; prefer MIME after fetching
+        const extGuess = extFromUrl(src) || 'jpg';
+        const suggested = sanitizeFilename(`${username || aweme || 'image'}_${currentIndex + 1}.${extGuess}`);
         const ok = await downloadUrlAsFile(src, suggested);
-        if (!ok) {
-          fallbackDirectDownload(src, suggested);
-        }
+        if (!ok) fallbackDirectDownload(src, suggested);
       };
 
       // download all: try zip via JSZip, fallback to individual downloads
@@ -1448,8 +1510,8 @@
         // fallback: attempt individual downloads
         for (let i = 0; i < imageUrls.length; i++) {
           const u = imageUrls[i];
-          const ext = (u.split('.').pop().split(/\#|\?/)[0] || 'jpg').substr(0,6);
-          const fname = `${zipNameBase || 'images'}_${i+1}.${ext}`;
+          const ext = extFromUrl(u) || 'jpg';
+          const fname = sanitizeFilename(`${zipNameBase || 'images'}_${i+1}.${ext}`);
           const ok = await downloadUrlAsFile(u, fname);
           if (!ok) fallbackDirectDownload(u, fname);
           // small delay to avoid overwhelming
@@ -1467,11 +1529,9 @@
             const res = await fetch(url, {mode: 'cors'});
             if (!res.ok) throw new Error('Fetch failed ' + res.status);
             const blob = await res.blob();
-            // guess extension
-            let ext = 'jpg';
-            const ct = blob.type || '';
-            if (ct && ct.includes('/')) ext = ct.split('/')[1].split(';')[0] || ext;
-            const filename = `${zipNameBase || 'img'}_${i+1}.${ext}`;
+            // get extension from MIME or URL
+            let ext = extFromMime(blob.type) || extFromUrl(url) || 'jpg';
+            const filename = sanitizeFilename(`${zipNameBase || 'img'}_${i+1}.${ext}`);
             zip.file(filename, blob);
           } catch (err) {
             console.debug('Failed fetch image for zip', url, err);
@@ -1497,8 +1557,8 @@
           alert(`${failures.length} image(s) couldn't be fetched due to CORS or network. Attempting direct downloads for those.`)
           for (let j = 0; j < failures.length; j++) {
             const u = failures[j];
-            const ext = (u.split('.').pop().split(/\#|\?/)[0] || 'jpg').substr(0,6);
-            const fname = `${zipNameBase || 'images'}_failed_${j+1}.${ext}`;
+            const ext = extFromUrl(u) || 'jpg';
+            const fname = sanitizeFilename(`${zipNameBase || 'images'}_failed_${j+1}.${ext}`);
             const ok = await downloadUrlAsFile(u, fname);
             if (!ok) fallbackDirectDownload(u, fname);
             await new Promise(r => setTimeout(r, 200));
@@ -1510,8 +1570,8 @@
         // fallback to individual
         for (let i = 0; i < imageUrls.length; i++) {
           const u = imageUrls[i];
-          const ext = (u.split('.').pop().split(/\#|\?/)[0] || 'jpg').substr(0,6);
-          const fname = `${zipNameBase || 'images'}_${i+1}.${ext}`;
+          const ext = extFromUrl(u) || 'jpg';
+          const fname = sanitizeFilename(`${zipNameBase || 'images'}_${i+1}.${ext}`);
           const ok = await downloadUrlAsFile(u, fname);
           if (!ok) fallbackDirectDownload(u, fname);
           await new Promise(r => setTimeout(r, 200));
@@ -1668,14 +1728,18 @@
         const btns = document.createElement('div');
         btns.className = 'card-buttons';
 
-        // Download (single) — for image slideshows point to first image and force download
+        // Download (single) — for image slideshows point to first image and force download (with proper extension)
         const dlAnchor = document.createElement('a');
         if (v.images && v.images.length) {
           dlAnchor.href = v.images[0];
-          dlAnchor.setAttribute('download','');
+          const ext = extFromUrl(v.images[0]) || 'jpg';
+          const filename = sanitizeFilename(`${v.username || v.aweme_id || 'image'}_1.${ext}`);
+          dlAnchor.setAttribute('download', filename);
         } else if (v.play_url) {
           dlAnchor.href = v.play_url;
-          dlAnchor.setAttribute('download','');
+          const ext2 = extFromUrl(v.play_url) || 'jpg';
+          const filename2 = sanitizeFilename(`${v.username || v.aweme_id || 'file'}_1.${ext2}`);
+          dlAnchor.setAttribute('download', filename2);
         } else {
           dlAnchor.href = '#';
         }
