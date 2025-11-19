@@ -521,6 +521,14 @@
 
     /* hide images-only control when not applicable */
     .videos-controls.hidden { display: none; }
+
+    /* small spinner inside HD button */
+    .hd-spinner {
+      display:inline-block;
+      width:14px;height:14px;border:2px solid rgba(255,255,255,0.2);
+      border-top-color:#fff;border-radius:50%;vertical-align:middle;margin-left:8px;
+      animation:spin 0.8s linear infinite;
+    }
   </style>
 </head>
 <body>
@@ -1518,7 +1526,7 @@
     btnImagesOnly.onclick = () => setImagesOnlyMode(true);
     btnShowAll.onclick = () => setImagesOnlyMode(false);
 
-    // -------- HD handling logic (uses server submit task via /api/from-url) --------
+    // -------- HD handling logic (ONLY uses submit task via /api/from-url; no fallback) --------
     async function handleHdAction(button) {
       if (!button || button.disabled) return;
       const aweme = button.dataset.aweme;
@@ -1527,60 +1535,88 @@
         return;
       }
 
-      // If the button already contains a ready HD url, download immediately.
+      // If already have hd url stored on button, download it directly
       if (button.dataset.hd) {
-        triggerDownload(button.dataset.hd);
+        button.disabled = true;
+        const orig = button.textContent;
+        button.textContent = 'Downloading HD — 1 moment';
+        // small spinner indicator
+        const spinner = document.createElement('span');
+        spinner.className = 'hd-spinner';
+        button.appendChild(spinner);
+        try {
+          triggerDownload(button.dataset.hd, `${aweme}_HD.mp4`);
+        } finally {
+          button.removeChild(spinner);
+          button.textContent = orig;
+          button.disabled = false;
+        }
         return;
       }
 
-      // Provide immediate UI feedback
-      const origText = button.textContent;
+      // Otherwise we MUST use submit task via POST /api/from-url and wait for hd_url
       button.disabled = true;
-      button.textContent = 'Preparing HD…';
+      const origText = button.textContent;
+      button.textContent = 'Downloading HD — 1 moment';
+      const spinner = document.createElement('span');
+      spinner.className = 'hd-spinner';
+      button.appendChild(spinner);
 
-      try {
-        // Construct TikTok URL — server /api/from-url will run submit_tikwm_task and persist hd if possible
-        const tUrl = `https://www.tiktok.com/video/${encodeURIComponent(aweme)}`;
-        const res = await fetch('/api/from-url', {
-          method: 'POST',
-          headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({url: tUrl})
-        });
+      const maxAttempts = 3;
+      let attempt = 0;
+      const tUrl = `https://www.tiktok.com/video/${encodeURIComponent(aweme)}`;
 
-        if (!res.ok) {
-          // fallback to download endpoint (server may attempt submit there as well)
-          console.debug('from-url returned non-ok; falling back to /download');
-          window.open(`/download?video_id=${encodeURIComponent(aweme)}&hd=1`, '_blank');
-          return;
+      while (attempt < maxAttempts) {
+        attempt++;
+        try {
+          const res = await fetch('/api/from-url', {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({url: tUrl})
+          });
+
+          if (!res.ok) {
+            console.debug('from-url attempt', attempt, 'status', res.status);
+            // retry if attempts remain
+          } else {
+            const body = await res.json().catch(()=>({}));
+            // server returns hd_url if submit_tikwm_task succeeded
+            const hd = body.hd_url || body.play_url || '';
+            if (hd) {
+              // store for future and download
+              button.dataset.hd = hd;
+              triggerDownload(hd, `${aweme}_HD.mp4`);
+              button.removeChild(spinner);
+              button.textContent = origText;
+              button.disabled = false;
+              return;
+            } else {
+              console.debug('from-url attempt', attempt, 'no hd returned yet');
+            }
+          }
+        } catch (err) {
+          console.debug('from-url attempt error', attempt, err);
         }
 
-        const body = await res.json();
-        // prefer hd_url from server response, then play_url, else fallback to /download
-        const hd = body.hd_url || body.play_url || '';
-        if (hd) {
-          triggerDownload(hd);
-          return;
-        } else {
-          console.debug('from-url returned no hd/play url; fallback to /download');
-          window.open(`/download?video_id=${encodeURIComponent(aweme)}&hd=1`, '_blank');
-          return;
+        // If not last attempt, wait a bit and retry
+        if (attempt < maxAttempts) {
+          await new Promise(res => setTimeout(res, 2000));
         }
-      } catch (e) {
-        console.debug('handleHdAction error', e);
-        window.open(`/download?video_id=${encodeURIComponent(aweme)}&hd=1`, '_blank');
-        return;
-      } finally {
-        button.disabled = false;
-        button.textContent = origText;
       }
+
+      // exhausted attempts — show failure (NO fallback to /download)
+      button.removeChild(spinner);
+      button.textContent = origText;
+      button.disabled = false;
+      alert('Failed to prepare HD after multiple attempts. Try again later.');
     }
 
-    function triggerDownload(url) {
+    function triggerDownload(url, filename) {
       if (!url) return;
       const a = document.createElement('a');
       a.href = url;
-      a.download = '';
-      // ensure anchor is in DOM so some browsers respect download
+      if (filename) a.download = filename;
+      else a.download = '';
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
