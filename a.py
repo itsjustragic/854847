@@ -11,9 +11,9 @@ import psycopg2
 import psycopg2.extras
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
-from urllib.parse import urlparse, quote_plus
+from urllib.parse import quote_plus
 from fastapi import FastAPI, HTTPException, Request, status, Body, Query, Depends
-from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse, Response
 from pydantic import BaseModel, HttpUrl, Field
 from jose import jwt
 from passlib.context import CryptContext
@@ -166,14 +166,12 @@ def save_users(users: Dict[str, dict]):
     if USE_DB:
         conn = _get_db_conn()
         cur = conn.cursor()
+        # Replace table contents to reflect the provided dict (so deletes persist)
+        cur.execute("DELETE FROM users;")
         for username, info in users.items():
             cur.execute("""
             INSERT INTO users (username, password, avatar, fetched_at)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (username) DO UPDATE
-              SET password = EXCLUDED.password,
-                  avatar = EXCLUDED.avatar,
-                  fetched_at = EXCLUDED.fetched_at;
+            VALUES (%s, %s, %s, %s);
             """, (username, info.get("password",""), info.get("avatar",""), info.get("fetched_at") or None))
         conn.commit()
         cur.close(); conn.close()
@@ -195,10 +193,10 @@ def save_invites(invites: dict):
     if USE_DB:
         conn = _get_db_conn()
         cur = conn.cursor()
+        cur.execute("DELETE FROM invites;")
         for code, used in invites.items():
             cur.execute("""
-            INSERT INTO invites (code, used) VALUES (%s, %s)
-            ON CONFLICT (code) DO UPDATE SET used = EXCLUDED.used;
+            INSERT INTO invites (code, used) VALUES (%s, %s);
             """, (code, bool(used)))
         conn.commit()
         cur.close(); conn.close()
@@ -220,10 +218,10 @@ def save_saved_urls(urls: List[dict]):
     if USE_DB:
         conn = _get_db_conn()
         cur = conn.cursor()
+        cur.execute("DELETE FROM saved_urls;")
         for entry in urls:
             cur.execute("""
-            INSERT INTO saved_urls (aweme_id, play_url, hd_url) VALUES (%s, %s, %s)
-            ON CONFLICT (aweme_id) DO UPDATE SET play_url = EXCLUDED.play_url, hd_url = EXCLUDED.hd_url;
+            INSERT INTO saved_urls (aweme_id, play_url, hd_url) VALUES (%s, %s, %s);
             """, (entry.get("aweme_id"), entry.get("play_url"), entry.get("hd_url")))
         conn.commit()
         cur.close(); conn.close()
@@ -248,6 +246,8 @@ def save_saved_user_urls(urls: List[dict]):
     if USE_DB:
         conn = _get_db_conn()
         cur = conn.cursor()
+        # Replace table contents so deletions persist
+        cur.execute("DELETE FROM saved_user_urls;")
         for entry in urls:
             cur.execute("""
             INSERT INTO saved_user_urls (username, aweme_id, play_url, hd_url, images)
@@ -276,13 +276,14 @@ def save_posts(posts: Dict[str, list]):
     if USE_DB:
         conn = _get_db_conn()
         cur = conn.cursor()
+        # Replace posts table contents to reflect provided posts structure
+        cur.execute("DELETE FROM posts;")
         for username, ups in posts.items():
             for p in ups:
                 aweme_id = p.get("aweme_id")
                 cur.execute("""
                 INSERT INTO posts (username, aweme_id, data)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (username, aweme_id) DO UPDATE SET data = EXCLUDED.data;
+                VALUES (%s, %s, %s);
                 """, (username, aweme_id, json.dumps(p)))
         conn.commit()
         cur.close(); conn.close()
@@ -576,7 +577,7 @@ async def api_delete_saved_user_urls(aweme_id: str, username: Optional[str] = Qu
     else:
         saved = [e for e in saved if str(e.get("aweme_id")) != str(aweme_id)]
     save_saved_user_urls(saved)
-    return JSONResponse(status_code=204, content={})
+    return Response(status_code=204)
 
 # -------------------- App startup: init DB --------------------
 @app.on_event("startup")
@@ -844,32 +845,42 @@ async def delete_user(username: str, request: Request = None):
         if token != ADMIN_TOKEN:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid admin token")
 
-    users = load_users()
-    deleted = set(load_deleted_users())
+    # DB-mode: perform direct deletes so removals are persisted immediately
+    if USE_DB:
+        try:
+            conn = _get_db_conn()
+            cur = conn.cursor()
+            cur.execute("DELETE FROM users WHERE username = %s;", (username,))
+            cur.execute("DELETE FROM posts WHERE username = %s;", (username,))
+            cur.execute("DELETE FROM saved_user_urls WHERE LOWER(username) = LOWER(%s);", (username,))
+            conn.commit()
+            cur.close(); conn.close()
+        except Exception:
+            logging.exception("DB-mode delete_user failed for %s", username)
+            # fallthrough to file-mode fallback below so that deleted_users gets updated
+    else:
+        users = load_users()
+        if username in users:
+            del users[username]
+            save_users(users)
 
-    # Remove from users if present
-    if username in users:
-        del users[username]
-        save_users(users)
+        posts = load_posts()
+        if username in posts:
+            del posts[username]
+            save_posts(posts)
 
-    # Remove any posts for that user
-    posts = load_posts()
-    if username in posts:
-        del posts[username]
-        save_posts(posts)
-
-    # Remove any saved_user_urls entries for that username
-    saved_user_urls = load_saved_user_urls()
-    saved_user_urls = [e for e in saved_user_urls if (e.get("username") or "").lower() != username.lower()]
-    save_saved_user_urls(saved_user_urls)
+        saved_user_urls = load_saved_user_urls()
+        saved_user_urls = [e for e in saved_user_urls if (e.get("username") or "").lower() != username.lower()]
+        save_saved_user_urls(saved_user_urls)
 
     # Add to deleted/blacklist so the app won't auto-recreate this user
+    deleted = set(load_deleted_users())
     if username not in deleted:
         deleted.add(username)
         save_deleted_users(list(deleted))
 
     logging.info("User %s deleted and blacklisted (must be re-added explicitly to restore)", username)
-    return JSONResponse(status_code=204, content={})
+    return Response(status_code=204)
 
 @app.get("/api/latest")
 async def api_latest():
@@ -1041,7 +1052,7 @@ async def delete_saved_url(aweme_id: str):
     saved = load_saved_urls()
     saved = [u for u in saved if u["aweme_id"] != aweme_id]
     save_saved_urls(saved)
-    return JSONResponse(status_code=204, content={})
+    return Response(status_code=204)
 
 @app.get("/api/saved-users")
 async def get_saved_users():
@@ -1076,31 +1087,42 @@ async def delete_saved_user(username: str):
       - remove saved_user_urls entries for the user
       - persist the username in deleted_users.json so it won't be auto-recreated
     """
-    users = load_users()
-    deleted = set(load_deleted_users())
+    # DB-mode direct deletes
+    if USE_DB:
+        try:
+            conn = _get_db_conn()
+            cur = conn.cursor()
+            cur.execute("DELETE FROM users WHERE username = %s;", (username,))
+            cur.execute("DELETE FROM posts WHERE username = %s;", (username,))
+            cur.execute("DELETE FROM saved_user_urls WHERE LOWER(username) = LOWER(%s);", (username,))
+            conn.commit()
+            cur.close(); conn.close()
+        except Exception:
+            logging.exception("DB-mode delete_saved_user failed for %s", username)
+            # fallback to file-mode below
+    else:
+        users = load_users()
+        if username in users:
+            del users[username]
+            save_users(users)
 
-    if username in users:
-        del users[username]
-        save_users(users)
+        posts = load_posts()
+        if username in posts:
+            del posts[username]
+            save_posts(posts)
 
-    # Remove posts
-    posts = load_posts()
-    if username in posts:
-        del posts[username]
-        save_posts(posts)
-
-    # Remove saved_user_urls entries for username
-    saved_user_urls = load_saved_user_urls()
-    saved_user_urls = [e for e in saved_user_urls if (e.get("username") or "").lower() != username.lower()]
-    save_saved_user_urls(saved_user_urls)
+        saved_user_urls = load_saved_user_urls()
+        saved_user_urls = [e for e in saved_user_urls if (e.get("username") or "").lower() != username.lower()]
+        save_saved_user_urls(saved_user_urls)
 
     # Persist blacklist
-    if username not in deleted:
+    if username not in load_deleted_users():
+        deleted = set(load_deleted_users())
         deleted.add(username)
         save_deleted_users(list(deleted))
 
     logging.info("Saved-user DELETE: user %s removed and blacklisted", username)
-    return JSONResponse(status_code=204, content={})
+    return Response(status_code=204)
 
 # -------------------- Slideshow endpoints (grouped) --------------------
 @app.get("/api/slideshow")
@@ -1155,7 +1177,7 @@ async def delete_slideshow(aweme_id: str, username: Optional[str] = Query(None))
     else:
         saved = [e for e in saved if e.get("aweme_id") != aweme_id]
     save_saved_user_urls(saved)
-    return JSONResponse(status_code=204, content={})
+    return Response(status_code=204)
 
 # -------------------- Image helpers endpoints (removed &hd=1 usage) --------------------
 @app.get("/api/images/username/{username}")
