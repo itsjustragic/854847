@@ -1527,6 +1527,25 @@
     btnShowAll.onclick = () => setImagesOnlyMode(false);
 
     // -------- HD handling logic (ONLY uses submit task via /api/from-url; no fallback) --------
+    // helper: start a same-origin download by loading your server's /download endpoint in a hidden iframe.
+    // This avoids opening a new tab and relies on your /download endpoint's Content-Disposition header.
+    function startProxyDownload(aweme) {
+      try {
+        const iframe = document.createElement('iframe');
+        iframe.style.display = 'none';
+        iframe.src = `/download?video_id=${encodeURIComponent(aweme)}&hd=1`;
+        // Append then remove later to allow the browser to initiate the download without navigation.
+        document.body.appendChild(iframe);
+        setTimeout(() => {
+          try { document.body.removeChild(iframe); } catch (e) {}
+        }, 60 * 1000); // remove after 60s
+      } catch (e) {
+        console.debug('startProxyDownload error', e);
+        // fallback: open in new tab (last resort)
+        window.open(`/download?video_id=${encodeURIComponent(aweme)}&hd=1`, '_blank');
+      }
+    }
+
     async function handleHdAction(button) {
       if (!button || button.disabled) return;
       const aweme = button.dataset.aweme;
@@ -1535,17 +1554,17 @@
         return;
       }
 
-      // If already have hd url stored on button, download it directly
+      // If we already have hd_url on the button (from saved data), don't hit third-party directly:
+      // call your server /download proxy so browser receives correct Content-Disposition and we avoid audio-only direct links.
       if (button.dataset.hd) {
         button.disabled = true;
         const orig = button.textContent;
         button.textContent = 'Downloading HD — 1 moment';
-        // small spinner indicator
         const spinner = document.createElement('span');
         spinner.className = 'hd-spinner';
         button.appendChild(spinner);
         try {
-          triggerDownload(button.dataset.hd, `${aweme}_HD.mp4`);
+          startProxyDownload(aweme);
         } finally {
           button.removeChild(spinner);
           button.textContent = orig;
@@ -1554,7 +1573,7 @@
         return;
       }
 
-      // Otherwise we MUST use submit task via POST /api/from-url and wait for hd_url
+      // Otherwise we MUST use submit task via POST /api/from-url and wait for server to provide HD (server stores it into HD_URLS)
       button.disabled = true;
       const origText = button.textContent;
       button.textContent = 'Downloading HD — 1 moment';
@@ -1583,9 +1602,10 @@
             // server returns hd_url if submit_tikwm_task succeeded
             const hd = body.hd_url || body.play_url || '';
             if (hd) {
-              // store for future and download
+              // store for future and trigger download via your server proxy (not direct third-party URL)
               button.dataset.hd = hd;
-              triggerDownload(hd, `${aweme}_HD.mp4`);
+              // Important: use your server's /download proxy so browser receives the attachment
+              startProxyDownload(aweme);
               button.removeChild(spinner);
               button.textContent = origText;
               button.disabled = false;
@@ -1609,17 +1629,6 @@
       button.textContent = origText;
       button.disabled = false;
       alert('Failed to prepare HD after multiple attempts. Try again later.');
-    }
-
-    function triggerDownload(url, filename) {
-      if (!url) return;
-      const a = document.createElement('a');
-      a.href = url;
-      if (filename) a.download = filename;
-      else a.download = '';
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
     }
 
     // Global delegation for HD triggers
