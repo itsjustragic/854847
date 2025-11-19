@@ -753,14 +753,39 @@ async def download(video_id: str, hd: int = 0):
     if not found:
         raise HTTPException(404, "Video not found")
 
+    # If HD requested and we don't have an HD url cached, try submit_tikwm_task up to 3 attempts.
     if hd and not HD_URLS.get(video_id):
-        task_res = submit_tikwm_task(video_id)
-        if task_res and task_res.get("play_url"):
-            HD_URLS[video_id] = task_res["play_url"]
-            saved = load_saved_urls()
-            saved = [u for u in saved if u.get("aweme_id") != video_id]
-            saved.insert(0, {"aweme_id": video_id, "play_url": found["play_url"], "hd_url": HD_URLS[video_id]})
-            save_saved_urls(saved)
+        task_res = None
+        for attempt in range(3):  # three attempts total as requested
+            try:
+                task_res = submit_tikwm_task(video_id)
+                if task_res and task_res.get("play_url"):
+                    HD_URLS[video_id] = task_res["play_url"]
+                    # persist into saved_urls
+                    try:
+                        saved = load_saved_urls()
+                        saved = [u for u in saved if u.get("aweme_id") != video_id]
+                        saved.insert(0, {"aweme_id": video_id, "play_url": found["play_url"], "hd_url": HD_URLS[video_id]})
+                        save_saved_urls(saved)
+                    except Exception:
+                        logging.exception("Failed to persist hd_url after tikwm submit for %s", video_id)
+                    logging.debug("download: obtained HD URL for %s on attempt %s", video_id, attempt + 1)
+                    break
+                else:
+                    logging.debug("download: submit_tikwm_task did not return play_url for %s on attempt %s", video_id, attempt + 1)
+            except Exception as e:
+                logging.debug("download: submit_tikwm_task attempt %s failed for %s: %s", attempt + 1, video_id, e)
+            time.sleep(1)
+        # If after attempts we still don't have an HD url, fallback to static hdplay path (no &hd=1 usage).
+        if not HD_URLS.get(video_id):
+            HD_URLS[video_id] = f"https://www.tikwm.com/video/media/hdplay/{video_id}.mp4"
+            try:
+                saved = load_saved_urls()
+                saved = [u for u in saved if u.get("aweme_id") != video_id]
+                saved.insert(0, {"aweme_id": video_id, "play_url": found["play_url"], "hd_url": HD_URLS[video_id]})
+                save_saved_urls(saved)
+            except Exception:
+                logging.exception("Failed to persist fallback hd_url for %s", video_id)
 
     url = HD_URLS.get(video_id) if hd else found["play_url"]
     r = requests.get(url, headers=WEB_HEADERS, timeout=15, stream=True)
@@ -906,9 +931,19 @@ async def from_url(payload: URLIn):
     if not aweme_id:
         raise HTTPException(400, "Could not extract video ID from URL")
 
-    task_result = submit_tikwm_task(final)
-    if task_result and task_result.get("play_url"):
-        play_url = task_result["play_url"]
+    # Try submit_tikwm_task up to 3 times (HD retrieval path)
+    task_res = None
+    for attempt in range(3):
+        try:
+            task_res = submit_tikwm_task(final)
+            if task_res and task_res.get("play_url"):
+                break
+        except Exception as e:
+            logging.debug("from_url: submit_tikwm_task attempt %s failed for %s: %s", attempt + 1, final, e)
+        time.sleep(1)
+
+    if task_res and task_res.get("play_url"):
+        play_url = task_res["play_url"]
         hd_url = play_url
         HD_URLS[aweme_id] = hd_url
         saved = load_saved_urls()
@@ -920,8 +955,9 @@ async def from_url(payload: URLIn):
         hd_url = f"https://www.tikwm.com/video/media/hdplay/{aweme_id}.mp4"
         HD_URLS[aweme_id] = hd_url
 
+    # NOTE: removed &hd=1 usage per request — fetch basic info endpoint
     try:
-        info = requests.get(f"https://www.tikwm.com/api/?url={final}&hd=1", headers=WEB_HEADERS, timeout=10).json()
+        info = requests.get(f"https://www.tikwm.com/api/?url={final}", headers=WEB_HEADERS, timeout=10).json()
         images = info.get("data", {}).get("images", [])
     except Exception:
         images = []
@@ -1052,7 +1088,7 @@ async def delete_slideshow(aweme_id: str, username: Optional[str] = Query(None))
     save_saved_user_urls(saved)
     return JSONResponse(status_code=204, content={})
 
-# -------------------- Image helpers endpoints (unchanged) --------------------
+# -------------------- Image helpers endpoints (updated - removed &hd=1) --------------------
 @app.get("/api/images/username/{username}")
 async def get_images_by_username(username: str):
     posts = load_posts()
@@ -1062,7 +1098,8 @@ async def get_images_by_username(username: str):
     for p in posts[username]:
         vid = p.get("aweme_id")
         try:
-            info = requests.get(f"https://www.tikwm.com/api/?url=https://www.tiktok.com/video/{vid}&hd=1", headers=WEB_HEADERS, timeout=10).json()
+            # removed &hd=1 per request - use base API endpoint
+            info = requests.get(f"https://www.tikwm.com/api/?url=https://www.tiktok.com/video/{vid}", headers=WEB_HEADERS, timeout=10).json()
             imgs = info.get("data", {}).get("images", [])
         except Exception:
             imgs = []
@@ -1073,7 +1110,8 @@ async def get_images_by_username(username: str):
 @app.get("/api/images/url/{video_id}")
 async def get_images_by_video(video_id: str):
     try:
-        info = requests.get(f"https://www.tikwm.com/api/?url=https://www.tiktok.com/video/{video_id}&hd=1", headers=WEB_HEADERS, timeout=10).json()
+        # removed &hd=1 per request
+        info = requests.get(f"https://www.tikwm.com/api/?url=https://www.tiktok.com/video/{video_id}", headers=WEB_HEADERS, timeout=10).json()
         imgs = info.get("data", {}).get("images", [])
     except Exception:
         imgs = []
