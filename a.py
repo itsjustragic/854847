@@ -12,7 +12,7 @@ import psycopg2.extras
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from urllib.parse import urlparse, quote_plus
-from fastapi import FastAPI, HTTPException, Request, status, BackgroundTasks, Body, Query, Depends
+from fastapi import FastAPI, HTTPException, Request, status, Body, Query, Depends
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, HttpUrl, Field
 from jose import jwt
@@ -832,8 +832,18 @@ async def api_users():
     ])
 
 @app.delete("/api/users/{username}", status_code=204)
-async def delete_user(username: str):
-    # Admin-protected in check_admin_token calling routes; here we assume appropriate middleware or header.
+async def delete_user(username: str, request: Request = None):
+    """
+    Admin delete endpoint — also performs full removal + blacklist.
+    If you are using the UI delete button, the UI calls /api/saved-users/{username} (which has also been updated),
+    so both endpoints behave the same.
+    """
+    # If ADMIN_TOKEN is set, enforce it
+    if ADMIN_TOKEN:
+        token = (request.headers.get("X-Admin-Token","") if request else "")
+        if token != ADMIN_TOKEN:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid admin token")
+
     users = load_users()
     deleted = set(load_deleted_users())
 
@@ -1058,10 +1068,38 @@ async def post_saved_user(u: UserIn):
 
 @app.delete("/api/saved-users/{username}", status_code=204)
 async def delete_saved_user(username: str):
+    """
+    This is the endpoint the frontend uses when you press the 'Delete' button on a saved user.
+    It now performs a full delete:
+      - remove from users.json / users table
+      - remove posts[username]
+      - remove saved_user_urls entries for the user
+      - persist the username in deleted_users.json so it won't be auto-recreated
+    """
     users = load_users()
+    deleted = set(load_deleted_users())
+
     if username in users:
         del users[username]
         save_users(users)
+
+    # Remove posts
+    posts = load_posts()
+    if username in posts:
+        del posts[username]
+        save_posts(posts)
+
+    # Remove saved_user_urls entries for username
+    saved_user_urls = load_saved_user_urls()
+    saved_user_urls = [e for e in saved_user_urls if (e.get("username") or "").lower() != username.lower()]
+    save_saved_user_urls(saved_user_urls)
+
+    # Persist blacklist
+    if username not in deleted:
+        deleted.add(username)
+        save_deleted_users(list(deleted))
+
+    logging.info("Saved-user DELETE: user %s removed and blacklisted", username)
     return JSONResponse(status_code=204, content={})
 
 # -------------------- Slideshow endpoints (grouped) --------------------
@@ -1182,9 +1220,7 @@ def check_admin_token(request: Request):
 async def safe_sleep(seconds: float):
     await asyncio.sleep(seconds)
 
-# (pinger_loop and ping endpoints unchanged — omitted here for brevity in commentary, but retained in file)
-# ... (pinger_loop implementation is the same as earlier in your file) ...
-
+# pinger_loop (keeps same behavior)
 async def pinger_loop(name: str, url: str, interval: int, max_runs: Optional[int]):
     meta: PingerMeta = PINGERS[name]["meta"]
     import httpx
