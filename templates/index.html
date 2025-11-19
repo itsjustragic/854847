@@ -558,7 +558,7 @@
   <div id="app-content">
     <header>
       <a href="/" class="logo-container">
-        <img src="/static/bop.png" alt="Bop Central Logo" class="logo" />
+        <img src="https://raw.githubusercontent.com/itsjustragic/854847/main/static/bop.png" alt="Bop Central Logo" class="logo" />
       </a>
       <nav>
         <a href="/" data-view="home">Home</a>
@@ -672,7 +672,7 @@
                      data-aweme-id="{{ v.aweme_id }}"
                      data-play-url="{{ v.play_url }}"
                      data-cover="{{ v.cover or '' }}">
-                  <img src="{{ v.cover or '/static/bop.png' }}" class="thumb" alt="thumb"/>
+                  <img src="{{ v.cover or 'https://raw.githubusercontent.com/itsjustragic/854847/main/static/bop.png' }}" class="thumb" alt="thumb"/>
                   <button class="btn-play" title="Load video">▶</button>
                 </div>
               {% endif %}
@@ -1071,7 +1071,7 @@
         const link = document.createElement('div');
         link.className='user-card';
         link.innerHTML = `
-          <img src="${u.avatar || '/static/bop.png'}" alt="${u.username}"/>
+          <img src="${u.avatar || 'https://raw.githubusercontent.com/itsjustragic/854847/main/static/bop.png'}" alt="${u.username}"/>
           <span class="handle">${u.username}</span>`;
         entry.appendChild(link);
 
@@ -1425,7 +1425,7 @@
       entries.forEach(v => {
         const card = document.createElement('div');
         card.className = 'card';
-        const thumbUrl = (v.images && v.images.length && v.images[0]) ? v.images[0] : (v.play_url || '/static/bop.png');
+        const thumbUrl = (v.images && v.images.length && v.images[0]) ? v.images[0] : (v.play_url || 'https://raw.githubusercontent.com/itsjustragic/854847/main/static/bop.png');
         const img = document.createElement('img');
         img.src = thumbUrl;
         img.className = 'single-img';
