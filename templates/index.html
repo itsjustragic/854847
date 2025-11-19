@@ -887,7 +887,6 @@
       if (mime.includes('webp')) return 'webp';
       if (mime.includes('svg')) return 'svg';
       if (mime.includes('bmp')) return 'bmp';
-      // fallback: take substring after '/'
       const parts = mime.split('/');
       if (parts.length>1) return parts[1].split(';')[0].slice(0,6);
       return '';
@@ -915,7 +914,6 @@
       const extMime = extFromUrl(url) || '';
       let ext = extMime || '';
       if (!ext) {
-        // can't infer ext from url — default to jpg and let blob/mime logic fix later
         ext = 'jpg';
       }
       const baseName = sanitizeFilename(base || (url ? url.split('/').pop().split('?')[0] : 'image'));
@@ -930,14 +928,11 @@
         const blob = await res.blob();
         const mime = blob.type || '';
         let ext = extFromMime(mime) || extFromUrl(url) || 'jpg';
-        // if suggestedName provided but has no ext, append ext
         let name = suggestedName || '';
         if (!name) {
-          // create a name using the last part of url or timestamp
           const guess = (url ? url.split('/').pop().split('?')[0] : '') || `image_${Date.now()}`;
           name = guess;
         }
-        // sanitize and ensure extension
         name = sanitizeFilename(name);
         if (!(/\.[A-Za-z0-9]{1,8}$/.test(name))) name = `${name}.${ext}`;
         const blobUrl = URL.createObjectURL(blob);
@@ -965,7 +960,6 @@
         const a = document.createElement('a');
         a.href = url;
         a.download = name;
-        // some browsers ignore download for cross-origin; open in new tab as last resort
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -1265,6 +1259,9 @@
             title.textContent = v.aweme_id || '';
             c.appendChild(title);
 
+            // store images on the card so we always read the right list
+            c.dataset.images = JSON.stringify(v.images || []);
+
             const btns = document.createElement('div');
             btns.className = 'card-buttons';
 
@@ -1282,10 +1279,16 @@
             // Download All images button (card-level)
             const dlAllBtn = document.createElement('button');
             dlAllBtn.textContent = 'Download All';
-            dlAllBtn.onclick = async () => {
-              // attempt zip
-              const imgs = JSON.parse(thumb.dataset.images || '[]');
-              if (!imgs.length) { alert('No images to download'); return; }
+            dlAllBtn.className = 'dl-all';
+            // attach dataset to button too to be explicit
+            dlAllBtn.dataset.images = JSON.stringify(v.images || []);
+            dlAllBtn.onclick = async (ev) => {
+              ev.preventDefault();
+              // read images specifically from this card/button dataset
+              const imgsJson = dlAllBtn.dataset.images || c.dataset.images || '[]';
+              let imgs;
+              try { imgs = JSON.parse(imgsJson || '[]'); } catch (e) { imgs = []; }
+              if (!imgs || !imgs.length) { alert('No images to download'); return; }
               await downloadAllImagesAsZip(imgs, `${username || 'slideshow'}_${v.aweme_id || Date.now()}`);
             };
             btns.appendChild(dlAllBtn);
@@ -1417,6 +1420,9 @@
       const downloadAllBtn = document.getElementById('modal-download-all');
       let currentImages = [];
       let currentIndex = 0;
+      // metadata for this modal instance
+      let modalUsername = '';
+      let modalAweme = '';
 
       function showModal(){
         if (!currentImages || !currentImages.length) return;
@@ -1445,9 +1451,8 @@
             if (!arr.length) return;
             currentImages = arr;
             currentIndex = 0;
-            // store metadata for suggested filenames
-            imgModal.dataset.username = img.dataset.username || '';
-            imgModal.dataset.aweme = img.dataset.awemeId || '';
+            modalUsername = img.dataset.username || '';
+            modalAweme = img.dataset.awemeId || '';
             showModal();
           };
         });
@@ -1460,9 +1465,8 @@
           if (!Array.isArray(images) || !images.length) return;
           currentImages = images;
           currentIndex = (typeof index === 'number' && index >= 0) ? (index % images.length) : 0;
-          // optional metadata
-          imgModal.dataset.username = (metadata && metadata.username) || imgModal.dataset.username || '';
-          imgModal.dataset.aweme = (metadata && metadata.aweme) || imgModal.dataset.aweme || '';
+          modalUsername = (metadata && metadata.username) || modalUsername || '';
+          modalAweme = (metadata && metadata.aweme) || modalAweme || '';
           showModal();
         } catch (e) {
           console.debug('openSlideshow error', e);
@@ -1476,9 +1480,8 @@
       downloadBtn.onclick = async () => {
         const src = modalImg.src;
         if (!src) { alert('No image to download'); return; }
-        const username = imgModal.dataset.username || '';
-        const aweme = imgModal.dataset.aweme || '';
-        // determine extension from URL first; prefer MIME after fetching
+        const username = modalUsername || '';
+        const aweme = modalAweme || '';
         const extGuess = extFromUrl(src) || 'jpg';
         const suggested = sanitizeFilename(`${username || aweme || 'image'}_${currentIndex + 1}.${extGuess}`);
         const ok = await downloadUrlAsFile(src, suggested);
@@ -1487,17 +1490,17 @@
 
       // download all: try zip via JSZip, fallback to individual downloads
       downloadAllBtn.onclick = async () => {
-        const imgs = currentImages || [];
+        // IMPORTANT: use only the images currently loaded into this modal (currentImages)
+        const imgs = Array.isArray(currentImages) ? currentImages.slice() : [];
         if (!imgs.length) { alert('No images to download'); return; }
-        const username = imgModal.dataset.username || '';
-        const aweme = imgModal.dataset.aweme || '';
-        await downloadAllImagesAsZip(imgs, `${username || aweme || 'slideshow'}_${Date.now()}`);
+        await downloadAllImagesAsZip(imgs, `${modalUsername || 'slideshow'}_${modalAweme || Date.now()}`);
       };
 
       imgModal.onclick = e => {
         if (e.target === imgModal) closeModal();
       };
 
+      // re-bind when slides are rendered/updated
       window.addEventListener('slideshowRendered', bindSingleImages);
     })();
 
@@ -1507,14 +1510,12 @@
       const zipName = `${zipNameBase || 'images'}_${(new Date()).toISOString().replace(/[:.]/g,'-')}.zip`;
       // If JSZip not available, fallback to sequential download
       if (typeof JSZip === 'undefined') {
-        // fallback: attempt individual downloads
         for (let i = 0; i < imageUrls.length; i++) {
           const u = imageUrls[i];
           const ext = extFromUrl(u) || 'jpg';
           const fname = sanitizeFilename(`${zipNameBase || 'images'}_${i+1}.${ext}`);
           const ok = await downloadUrlAsFile(u, fname);
           if (!ok) fallbackDirectDownload(u, fname);
-          // small delay to avoid overwhelming
           await new Promise(r => setTimeout(r, 200));
         }
         return;
@@ -1529,7 +1530,6 @@
             const res = await fetch(url, {mode: 'cors'});
             if (!res.ok) throw new Error('Fetch failed ' + res.status);
             const blob = await res.blob();
-            // get extension from MIME or URL
             let ext = extFromMime(blob.type) || extFromUrl(url) || 'jpg';
             const filename = sanitizeFilename(`${zipNameBase || 'img'}_${i+1}.${ext}`);
             zip.file(filename, blob);
@@ -1541,7 +1541,6 @@
 
         if (zip && Object.keys(zip.files).length > 0) {
           const content = await zip.generateAsync({type:"blob"});
-          // download the zip
           const blobUrl = URL.createObjectURL(content);
           const a = document.createElement('a');
           a.href = blobUrl;
@@ -1552,7 +1551,6 @@
           URL.revokeObjectURL(blobUrl);
         }
 
-        // If there were failures, attempt individual downloads for those
         if (failures.length) {
           alert(`${failures.length} image(s) couldn't be fetched due to CORS or network. Attempting direct downloads for those.`)
           for (let j = 0; j < failures.length; j++) {
@@ -1567,7 +1565,6 @@
 
       } catch (e) {
         console.debug('downloadAllImagesAsZip error; falling back to individual downloads', e);
-        // fallback to individual
         for (let i = 0; i < imageUrls.length; i++) {
           const u = imageUrls[i];
           const ext = extFromUrl(u) || 'jpg';
@@ -1712,6 +1709,9 @@
       entries.forEach(v => {
         const card = document.createElement('div');
         card.className = 'card';
+        // store the images on the card explicitly so handlers always use this single-card dataset
+        card.dataset.images = JSON.stringify(v.images || []);
+
         const thumbUrl = (v.images && v.images.length && v.images[0]) ? v.images[0] : (v.play_url || 'https://raw.githubusercontent.com/itsjustragic/854847/main/static/bop.png');
         const img = document.createElement('img');
         img.src = thumbUrl;
@@ -1721,10 +1721,12 @@
         img.dataset.awemeId = v.aweme_id || '';
         img.dataset.username = v.username || '';
         card.appendChild(img);
+
         const info = document.createElement('div');
         info.className = 'title';
         info.textContent = `${v.username} • ${v.aweme_id}`;
         card.appendChild(info);
+
         const btns = document.createElement('div');
         btns.className = 'card-buttons';
 
@@ -1748,12 +1750,22 @@
         dlAnchor.appendChild(dlBtn);
         btns.appendChild(dlAnchor);
 
-        // Download All (card-level) - zips all images
+        // Download All (card-level) - zips all images of THIS card only
         const dlAllBtn = document.createElement('button');
         dlAllBtn.textContent = 'Download All';
-        dlAllBtn.onclick = async () => {
-          const imgs = v.images || (v.play_url ? [v.play_url] : []);
-          if (!imgs.length) { alert('No images to download'); return; }
+        dlAllBtn.className = 'dl-all';
+        // attach dataset to button for guaranteed single-card behavior
+        dlAllBtn.dataset.images = JSON.stringify(v.images || []);
+        dlAllBtn.onclick = async (ev) => {
+          ev.preventDefault();
+          // Read images specifically for this card
+          let imgs;
+          try {
+            imgs = JSON.parse(dlAllBtn.dataset.images || card.dataset.images || '[]');
+          } catch (e) {
+            imgs = [];
+          }
+          if (!imgs || !imgs.length) { alert('No images to download for this slideshow'); return; }
           await downloadAllImagesAsZip(imgs, `${(v.username||'slideshow')}_${v.aweme_id || Date.now()}`);
         };
         btns.appendChild(dlAllBtn);
@@ -1762,7 +1774,7 @@
         const viewBtn = document.createElement('button');
         viewBtn.textContent = 'View';
         viewBtn.onclick = () => {
-          const imgsArr = JSON.parse(img.dataset.images || '[]');
+          const imgsArr = JSON.parse(img.dataset.images || card.dataset.images || '[]');
           if (!imgsArr || !imgsArr.length) {
             alert('No images in this slideshow');
             return;
