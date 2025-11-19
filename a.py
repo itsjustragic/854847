@@ -24,6 +24,9 @@ from fastapi.templating import Jinja2Templates
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")  # Set to protect endpoints. If empty, endpoints are open.
 DEFAULT_INTERVAL = 60  # seconds
 
+# Force pingers to run continuously (overrides provided max_runs and prevents automatic stopping)
+FORCE_RUN_24_7 = True
+
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ping_api")
@@ -32,6 +35,8 @@ log = logging.getLogger("ping_api")
 DATA_DIR = os.getenv("DATA_DIR", "data")
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
+
+PINGERS_FILE = os.path.join(DATA_DIR, "pingers.json")
 
 DATABASE_URL = os.getenv("DATABASE_URL")  # e.g. set by Render: postgres://user:pass@host:port/dbname
 USE_DB = bool(DATABASE_URL)
@@ -597,6 +602,39 @@ async def startup_event():
         except Exception as e:
             logging.debug("Failed to load hd urls into memory: %s", e)
 
+    # --- Load persisted pingers and restart them automatically ---
+    try:
+        defs = load_json(PINGERS_FILE, [])
+        if isinstance(defs, list):
+            started = 0
+            async with PINGERS_LOCK:
+                for d in defs:
+                    name = d.get("name")
+                    url = d.get("url")
+                    interval = int(d.get("interval") or DEFAULT_INTERVAL)
+                    max_runs = d.get("max_runs")
+                    # Force continuous operation if configured
+                    if FORCE_RUN_24_7:
+                        max_runs = None
+                    if not name or not url:
+                        continue
+                    if name in PINGERS:
+                        continue
+                    meta = PingerMeta(
+                        name=name,
+                        url=url,
+                        interval=interval,
+                        started_at=d.get("started_at") or datetime.utcnow().isoformat() + "Z",
+                        max_runs=max_runs
+                    )
+                    # create the task and store
+                    task = asyncio.create_task(pinger_loop(name=name, url=url, interval=interval, max_runs=max_runs))
+                    PINGERS[name] = {"meta": meta, "task": task}
+                    started += 1
+            logging.info("Startup: restarted %d persisted pinger(s)", started)
+    except Exception:
+        logging.exception("Failed to restart persisted pingers on startup")
+
 # -------------------- Routes --------------------
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request, q: str = None, type: str = Query(None, regex="^(latest|top)?$")):
@@ -1085,7 +1123,7 @@ async def delete_saved_user(username: str):
       - remove from users.json / users table
       - remove posts[username]
       - remove saved_user_urls entries for the user
-      - persist the username in deleted_users.json so it won't be auto-recreated
+      - persist the username in deleted_users.json so it won't be auto-created
     """
     # DB-mode direct deletes
     if USE_DB:
@@ -1242,13 +1280,49 @@ def check_admin_token(request: Request):
 async def safe_sleep(seconds: float):
     await asyncio.sleep(seconds)
 
-# pinger_loop (keeps same behavior)
+# ---------------- pinger persistence helpers ----------------
+def _serialize_meta(m: PingerMeta) -> dict:
+    return {
+        "name": m.name,
+        "url": m.url,
+        "interval": m.interval,
+        "started_at": m.started_at,
+        "max_runs": m.max_runs
+    }
+
+def persist_pingers_to_file():
+    try:
+        with open(PINGERS_FILE, "w", encoding="utf-8") as f:
+            arr = []
+            # Ensure we capture consistent snapshot
+            for name, entry in list(PINGERS.items()):
+                try:
+                    meta: PingerMeta = entry["meta"]
+                    arr.append(_serialize_meta(meta))
+                except Exception:
+                    continue
+            json.dump(arr, f, indent=2, ensure_ascii=False)
+    except Exception:
+        logging.exception("Failed to persist pingers to file")
+
+def remove_pinger_from_file(name: str):
+    try:
+        arr = load_json(PINGERS_FILE, [])
+        if not isinstance(arr, list):
+            arr = []
+        arr = [d for d in arr if d.get("name") != name]
+        save_json(PINGERS_FILE, arr)
+    except Exception:
+        logging.exception("Failed to remove pinger from persisted file: %s", name)
+
+# pinger_loop (keeps same behavior but made more robust and persistent)
 async def pinger_loop(name: str, url: str, interval: int, max_runs: Optional[int]):
     meta: PingerMeta = PINGERS[name]["meta"]
     import httpx
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             while True:
+                # If pinger definition removed externally (and we removed from PINGERS), exit.
                 if PINGERS.get(name) is None:
                     log.info("Pinger %s requested stop (entry removed)", name)
                     break
@@ -1264,8 +1338,10 @@ async def pinger_loop(name: str, url: str, interval: int, max_runs: Optional[int
                         m.runs += 1
                         m.last_status_code = status_code
                         m.last_error = None
+                        m.status = "running"
                 except asyncio.CancelledError:
                     log.info("Pinger %s cancelled during request", name)
+                    # Do NOT set status to stopped here if FORCE_RUN_24_7 is True; tasks should be recreated on startup
                     break
                 except Exception as e:
                     log.exception("Pinger %s error while pinging %s", name, url)
@@ -1277,15 +1353,23 @@ async def pinger_loop(name: str, url: str, interval: int, max_runs: Optional[int
                             m.last_status_code = None
                             m.last_error = repr(e)
                             m.status = "error"
-                async with PINGERS_LOCK:
-                    if name not in PINGERS:
-                        log.info("Pinger %s removed; exiting loop", name)
-                        break
-                    m: PingerMeta = PINGERS[name]["meta"]
-                    if m.max_runs and m.runs >= m.max_runs:
-                        m.status = "stopped"
-                        log.info("Pinger %s reached max_runs (%s), stopping", name, m.max_runs)
-                        break
+                # Persist meta snapshot to file so the pinger is restartable
+                try:
+                    async with PINGERS_LOCK:
+                        persist_pingers_to_file()
+                except Exception:
+                    logging.debug("Failed to persist pingers while running loop for %s", name)
+                # If a max_runs was set originally, we intentionally ignore it when FORCE_RUN_24_7==True
+                if (not FORCE_RUN_24_7) and max_runs:
+                    async with PINGERS_LOCK:
+                        if name not in PINGERS:
+                            log.info("Pinger %s removed; exiting loop", name)
+                            break
+                        m: PingerMeta = PINGERS[name]["meta"]
+                        if m.max_runs and m.runs >= m.max_runs:
+                            m.status = "stopped"
+                            log.info("Pinger %s reached max_runs (%s), stopping", name, m.max_runs)
+                            break
                 try:
                     await safe_sleep(interval)
                 except asyncio.CancelledError:
@@ -1294,7 +1378,11 @@ async def pinger_loop(name: str, url: str, interval: int, max_runs: Optional[int
         finally:
             async with PINGERS_LOCK:
                 if name in PINGERS:
-                    PINGERS[name]["meta"].status = PINGERS[name]["meta"].status or "stopped"
+                    # keep meta visible but mark not running if task exited unexpectedly
+                    try:
+                        PINGERS[name]["meta"].status = PINGERS[name]["meta"].status or "stopped"
+                    except Exception:
+                        pass
             log.info("Pinger %s loop exited", name)
 
 @app.post("/api/ping/start")
@@ -1303,7 +1391,10 @@ async def api_ping_start(payload: StartPingIn, request: Request):
     name = payload.name or f"keep-{int(datetime.utcnow().timestamp())}"
     name = name.strip()
     interval = int(payload.interval or DEFAULT_INTERVAL)
+    # ignore provided max_runs when forcing continuous operation
     max_runs = int(payload.max_runs) if payload.max_runs is not None else None
+    if FORCE_RUN_24_7:
+        max_runs = None
     url = str(payload.url)
     async with PINGERS_LOCK:
         if name in PINGERS:
@@ -1317,7 +1408,12 @@ async def api_ping_start(payload: StartPingIn, request: Request):
         )
         task = asyncio.create_task(pinger_loop(name=name, url=url, interval=interval, max_runs=max_runs))
         PINGERS[name] = {"meta": meta, "task": task}
-    log.info("Started pinger '%s' -> %s every %ss", name, url, interval)
+        # persist to file
+        try:
+            persist_pingers_to_file()
+        except Exception:
+            logging.exception("Failed to persist pingers after start")
+    log.info("Started pinger '%s' -> %s every %ss (max_runs=%s)", name, url, interval, max_runs)
     return JSONResponse({"ok": True, "name": name, "url": url, "interval": interval, "max_runs": max_runs})
 
 @app.post("/api/ping/stop")
@@ -1329,12 +1425,18 @@ async def api_ping_stop(payload: StopPingIn, request: Request):
             raise HTTPException(status_code=404, detail=f"No pinger named '{name}'")
         entry = PINGERS.pop(name)
         task: asyncio.Task = entry.get("task")
+        # attempt to cancel the running task gracefully
         if task and not task.done():
             task.cancel()
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
         except Exception:
             pass
+        # remove from persisted file
+        try:
+            remove_pinger_from_file(name)
+        except Exception:
+            logging.exception("Failed to remove pinger from persisted file during stop: %s", name)
     log.info("Stopped and removed pinger '%s'", name)
     return JSONResponse({"ok": True, "name": name})
 
@@ -1350,23 +1452,16 @@ async def api_ping_health():
     return {"status": "ok", "active_pingers": len(PINGERS)}
 
 # ---------------- graceful shutdown ----------------
+# NOTE: We intentionally do NOT cancel pinger tasks here. Tasks will be restarted on next startup
+# because pinger definitions are persisted to disk. This avoids killing pings on FastAPI's shutdown.
 @app.on_event("shutdown")
 async def shutdown_event():
-    log.info("Shutdown event: cancelling %d pinger(s)", len(PINGERS))
-    async with PINGERS_LOCK:
-        names = list(PINGERS.keys())
-    for name in names:
-        async with PINGERS_LOCK:
-            entry = PINGERS.pop(name, None)
-        if entry:
-            task = entry.get("task")
-            if task and not task.done():
-                task.cancel()
-                try:
-                    await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
-                except Exception:
-                    pass
-    log.info("All pingers cancelled on shutdown")
+    log.info("Shutdown event: preserving %d pinger(s) for restart on next startup", len(PINGERS))
+    # Do not cancel tasks; they will die when process exits but persisted entries will be restarted on next startup.
+    try:
+        persist_pingers_to_file()
+    except Exception:
+        logging.exception("Failed to persist pingers during shutdown")
 
 @app.get("/ping")
 async def ping():
