@@ -27,6 +27,11 @@ DEFAULT_INTERVAL = 60  # seconds
 # Force pingers to run continuously (overrides provided max_runs and prevents automatic stopping)
 FORCE_RUN_24_7 = True
 
+# Default keep-alive pinger name and interval (used when no persisted pinger exists)
+DEFAULT_KEEP_NAME = "keep-bopcentral"
+DEFAULT_KEEP_URL = "https://bopcentral.onrender.com/"
+DEFAULT_KEEP_INTERVAL = DEFAULT_INTERVAL  # seconds
+
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ping_api")
@@ -605,8 +610,8 @@ async def startup_event():
     # --- Load persisted pingers and restart them automatically ---
     try:
         defs = load_json(PINGERS_FILE, [])
+        started = 0
         if isinstance(defs, list):
-            started = 0
             async with PINGERS_LOCK:
                 for d in defs:
                     name = d.get("name")
@@ -627,13 +632,41 @@ async def startup_event():
                         started_at=d.get("started_at") or datetime.utcnow().isoformat() + "Z",
                         max_runs=max_runs
                     )
-                    # create the task and store
                     task = asyncio.create_task(pinger_loop(name=name, url=url, interval=interval, max_runs=max_runs))
                     PINGERS[name] = {"meta": meta, "task": task}
                     started += 1
-            logging.info("Startup: restarted %d persisted pinger(s)", started)
+        logging.info("Startup: restarted %d persisted pinger(s)", started)
+
+        # If FORCE_RUN_24_7 and no pinger for bopcentral exists, create one now
+        if FORCE_RUN_24_7:
+            async with PINGERS_LOCK:
+                if DEFAULT_KEEP_NAME not in PINGERS:
+                    meta = PingerMeta(
+                        name=DEFAULT_KEEP_NAME,
+                        url=DEFAULT_KEEP_URL,
+                        interval=DEFAULT_KEEP_INTERVAL,
+                        started_at=datetime.utcnow().isoformat() + "Z",
+                        max_runs=None
+                    )
+                    task = asyncio.create_task(pinger_loop(name=DEFAULT_KEEP_NAME, url=DEFAULT_KEEP_URL, interval=DEFAULT_KEEP_INTERVAL, max_runs=None))
+                    PINGERS[DEFAULT_KEEP_NAME] = {"meta": meta, "task": task}
+                    # persist the default pinger to file (ensures restart next time)
+                    try:
+                        persist_pingers_to_file()
+                    except Exception:
+                        logging.exception("Failed to persist default pinger after startup")
+                    logging.info("Startup: created default persistent pinger '%s' -> %s every %ss", DEFAULT_KEEP_NAME, DEFAULT_KEEP_URL, DEFAULT_KEEP_INTERVAL)
     except Exception:
         logging.exception("Failed to restart persisted pingers on startup")
+
+    # Start the watchdog monitor that ensures persisted pingers always have running tasks
+    try:
+        # Create and store the monitor task so we can optionally cancel it during shutdown
+        global PINGERS_MONITOR_TASK
+        PINGERS_MONITOR_TASK = asyncio.create_task(pingers_watchdog())
+        logging.info("Pingers watchdog started")
+    except Exception:
+        logging.exception("Failed to start pingers_watchdog")
 
 # -------------------- Routes --------------------
 @app.get("/", response_class=HTMLResponse)
@@ -1260,6 +1293,9 @@ class PingerMeta(BaseModel):
 PINGERS: Dict[str, Dict[str, Any]] = {}
 PINGERS_LOCK = asyncio.Lock()
 
+# Watchdog monitor task handle (set on startup)
+PINGERS_MONITOR_TASK: Optional[asyncio.Task] = None
+
 # ---------------- request models ----------------
 class StartPingIn(BaseModel):
     url: HttpUrl
@@ -1385,6 +1421,98 @@ async def pinger_loop(name: str, url: str, interval: int, max_runs: Optional[int
                         pass
             log.info("Pinger %s loop exited", name)
 
+# -------------------- Watchdog monitor: ensures persisted pingers have running tasks --------------------
+async def pingers_watchdog(check_interval: int = 30):
+    """
+    Background monitor that ensures persisted pinger definitions have running tasks.
+    If a pinger task is missing or done, it recreates the task (and updates PINGERS).
+    """
+    logging.info("pingers_watchdog: starting (interval=%s)", check_interval)
+    while True:
+        try:
+            # load persisted definitions once in this loop
+            try:
+                defs = load_json(PINGERS_FILE, [])
+            except Exception:
+                defs = []
+            # Build a map from name -> def for persisted definitions
+            persisted = {}
+            if isinstance(defs, list):
+                for d in defs:
+                    n = d.get("name")
+                    if not n:
+                        continue
+                    persisted[n] = d
+
+            async with PINGERS_LOCK:
+                # Ensure persisted definitions are present in PINGERS and running
+                for name, d in persisted.items():
+                    try:
+                        url = d.get("url")
+                        interval = int(d.get("interval") or DEFAULT_INTERVAL)
+                        max_runs = d.get("max_runs")
+                        if FORCE_RUN_24_7:
+                            max_runs = None
+                        if name in PINGERS:
+                            task = PINGERS[name].get("task")
+                            # If task missing or done, restart
+                            if (not task) or (task.done()):
+                                logging.warning("pingers_watchdog: task for '%s' missing/done — recreating", name)
+                                meta = PINGERS[name]["meta"]
+                                # ensure meta has the latest persisted interval/url
+                                meta.url = url or meta.url
+                                meta.interval = interval or meta.interval
+                                meta.max_runs = max_runs
+                                new_task = asyncio.create_task(pinger_loop(name=name, url=meta.url, interval=meta.interval, max_runs=meta.max_runs))
+                                PINGERS[name]["task"] = new_task
+                        else:
+                            # not present: create it
+                            logging.info("pingers_watchdog: creating missing pinger entry for '%s'", name)
+                            meta = PingerMeta(
+                                name=name,
+                                url=url,
+                                interval=interval,
+                                started_at=d.get("started_at") or datetime.utcnow().isoformat() + "Z",
+                                max_runs=max_runs
+                            )
+                            task = asyncio.create_task(pinger_loop(name=name, url=url, interval=interval, max_runs=max_runs))
+                            PINGERS[name] = {"meta": meta, "task": task}
+                    except Exception:
+                        logging.exception("pingers_watchdog: failed to ensure persisted pinger %s", name)
+
+                # If FORCE_RUN_24_7 is True, ensure default keep pinger exists
+                if FORCE_RUN_24_7:
+                    if DEFAULT_KEEP_NAME not in PINGERS:
+                        try:
+                            logging.info("pingers_watchdog: creating default keep pinger '%s'", DEFAULT_KEEP_NAME)
+                            meta = PingerMeta(
+                                name=DEFAULT_KEEP_NAME,
+                                url=DEFAULT_KEEP_URL,
+                                interval=DEFAULT_KEEP_INTERVAL,
+                                started_at=datetime.utcnow().isoformat() + "Z",
+                                max_runs=None
+                            )
+                            task = asyncio.create_task(pinger_loop(name=DEFAULT_KEEP_NAME, url=DEFAULT_KEEP_URL, interval=DEFAULT_KEEP_INTERVAL, max_runs=None))
+                            PINGERS[DEFAULT_KEEP_NAME] = {"meta": meta, "task": task}
+                            persist_pingers_to_file()
+                        except Exception:
+                            logging.exception("pingers_watchdog: failed to create default keep pinger")
+                # Also, if there are entries in PINGERS that are not persisted (e.g. created by API), ensure they are persisted
+                try:
+                    persist_pingers_to_file()
+                except Exception:
+                    logging.debug("pingers_watchdog: persist failed")
+        except asyncio.CancelledError:
+            logging.info("pingers_watchdog: cancelled; exiting")
+            break
+        except Exception:
+            logging.exception("pingers_watchdog: unexpected error")
+        try:
+            await asyncio.sleep(check_interval)
+        except asyncio.CancelledError:
+            logging.info("pingers_watchdog: cancelled during sleep; exiting")
+            break
+
 @app.post("/api/ping/start")
 async def api_ping_start(payload: StartPingIn, request: Request):
     check_admin_token(request)
@@ -1457,7 +1585,19 @@ async def api_ping_health():
 @app.on_event("shutdown")
 async def shutdown_event():
     log.info("Shutdown event: preserving %d pinger(s) for restart on next startup", len(PINGERS))
-    # Do not cancel tasks; they will die when process exits but persisted entries will be restarted on next startup.
+    # Attempt to cancel watchdog monitor task (optional)
+    global PINGERS_MONITOR_TASK
+    try:
+        if PINGERS_MONITOR_TASK and not PINGERS_MONITOR_TASK.done():
+            PINGERS_MONITOR_TASK.cancel()
+            try:
+                await asyncio.wait_for(PINGERS_MONITOR_TASK, timeout=2.0)
+            except Exception:
+                pass
+    except Exception:
+        logging.exception("Failed to cancel pingers_watchdog cleanly")
+
+    # Do not cancel pinger tasks; they will die when process exits but persisted entries will be restarted on next startup.
     try:
         persist_pingers_to_file()
     except Exception:
