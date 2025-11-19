@@ -21,6 +21,9 @@
   <!-- Prevent indexing -->
   <meta name="robots" content="noindex,nofollow" />
 
+  <!-- JSZip for zipping multiple images to a single ZIP (CDN) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" integrity="sha512-4gM9G56u5Xb0u1tLQ6z0k7Jz6V1Xq0f3v2w3HUCmYh5s9f2aOqzJ1xC3u2mL3Q8r5v2O3QbqkP4n5YlK7Yb2g==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+
   <style>
     /* disable selection and copying */
     * {
@@ -359,7 +362,8 @@
     #image-modal .prev { left: 10px; }
     #image-modal .next { right: 10px; }
     #image-modal .close,
-    #modal-download {
+    #modal-download,
+    #modal-download-all {
       position: absolute;
       top: 20px;
       font-size: 2rem;
@@ -367,14 +371,18 @@
       cursor: pointer;
       user-select: none;
       text-shadow: 0 0 8px #ff004f;
-    }
-    #image-modal .close { right: 30px; }
-    #modal-download {
-      right: 80px;
       background: none;
       border: none;
     }
-    #modal-download:hover {
+    #image-modal .close { right: 30px; }
+    #modal-download {
+      right: 120px;
+    }
+    #modal-download-all {
+      right: 180px;
+    }
+    #modal-download:hover,
+    #modal-download-all:hover {
       color: #ff004f;
     }
 
@@ -642,15 +650,12 @@
     <div id="page-videos" style="display:none;">
       <section id="videos-section">
         <h3 style="text-align:center;">
-          {% if active_q %}
-            Results for "{{ active_q }}"
+          {% if active_q %} Results for "{{ active_q }}"
           {% elif view_type == 'latest' %} Latest Videos
           {% elif view_type == 'top' %} Top Videos
           {% endif %}
         </h3>
 
-        <!-- Controls: default to "images only" per your request (stories) -->
-        <!-- We'll hide or show this block depending on view_type via JS -->
         <div id="videos-controls" class="videos-controls" style="margin-bottom:12px;">
           <button id="btn-images-only" class="active" title="Show only image/story posts on load">Stories (images)</button>
           <button id="btn-show-all" title="Show videos too (lazy-loaded)">Show videos</button>
@@ -661,9 +666,7 @@
         <div class="grid" id="videos-grid">
           {% for v in user_videos %}
             <div class="card" data-aweme="{{ v.aweme_id }}" data-hd="{{ hd_urls.get(v.aweme_id,'') }}">
-              {# If view_type is latest or top, DO NOT render image/story cards — always render video placeholder #}
               {% if v.images and v.images|length > 0 and (view_type not in ['latest','top']) %}
-                <!-- image story card (only when not latest/top) -->
                 <img
                   src="{{ v.images[0] }}"
                   class="single-img"
@@ -675,7 +678,6 @@
                   <audio controls src="{{ v.play_url }}"></audio>
                 {% endif %}
               {% else %}
-                <!-- render as video placeholder for latest/top OR when no images -->
                 <div class="video-placeholder"
                      data-aweme-id="{{ v.aweme_id }}"
                      data-play-url="{{ v.play_url }}"
@@ -688,8 +690,10 @@
               <div class="views" id="views-{{ v.aweme_id }}">{{ v.play_count }} views</div>
               <div class="card-buttons">
                 <a href="/download?video_id={{ v.aweme_id }}&hd=0" download><button>Download</button></a>
-                <!-- HD button now uses JS that invokes server submit task -->
-                <button class="hd-trigger" data-aweme="{{ v.aweme_id }}">HD</button>
+                <!-- keep HD for video cards only; slideshow/image cards below won't show HD -->
+                {% if not (v.images and v.images|length > 0) %}
+                  <button class="hd-trigger" data-aweme="{{ v.aweme_id }}">HD</button>
+                {% endif %}
               </div>
             </div>
           {% endfor %}
@@ -719,11 +723,12 @@
 
   <!-- Image Slideshow Modal -->
   <div id="image-modal">
-    <span class="close">&times;</span>
-    <span class="prev">&#10094;</span>
+    <span class="close" title="Close">&times;</span>
+    <span class="prev" title="Previous">&#10094;</span>
     <img src="" />
-    <button id="modal-download" title="Download image">⬇</button>
-    <span class="next">&#10095;</span>
+    <button id="modal-download" title="Download this image">⬇</button>
+    <button id="modal-download-all" title="Download all images in slideshow">⬇⬇ All</button>
+    <span class="next" title="Next">&#10095;</span>
   </div>
 
   <!-- Admin Password Modal -->
@@ -871,6 +876,43 @@
           else alert('Failed to delete URL');
         };
       });
+    }
+
+    // helper to download a remote URL as a file using fetch -> blob
+    async function downloadUrlAsFile(url, suggestedName) {
+      try {
+        const res = await fetch(url, {mode: 'cors'});
+        if (!res.ok) throw new Error('Network response not ok: ' + res.status);
+        const blob = await res.blob();
+        const blobUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = blobUrl;
+        a.download = suggestedName || '';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(blobUrl);
+        return true;
+      } catch (err) {
+        console.debug('downloadUrlAsFile failed for', url, err);
+        return false;
+      }
+    }
+
+    // fallback simple downloader (may open in new tab if cross-origin prevents download)
+    function fallbackDirectDownload(url, suggestedName) {
+      try {
+        const a = document.createElement('a');
+        a.href = url;
+        if (suggestedName) a.download = suggestedName;
+        a.target = '_blank';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+      } catch (e) {
+        console.debug('fallbackDirectDownload failed', e);
+        window.open(url, '_blank');
+      }
     }
 
     // URL form handler
@@ -1062,7 +1104,6 @@
           </div>
           <div class="card-buttons">
             <a href="/download?video_id=${v.aweme_id}&hd=0" download><button>Download</button></a>
-            <button class="hd-trigger" data-aweme="${v.aweme_id}">HD</button>
           </div>
           <button class="delete-url" data-aweme="${v.aweme_id}">
             Delete
@@ -1136,7 +1177,7 @@
       bindDeleteUsers();
     }
 
-    // SHOW SAVED USER PAGE (with download buttons now)
+    // SHOW SAVED USER PAGE (with image download buttons, no HD buttons for images)
     async function showSavedUser(username){
       document.getElementById('saved-user-title').textContent = `Videos & Slideshows for ${username}`;
       const grid = document.getElementById('saved-user-grid');
@@ -1151,31 +1192,73 @@
           c.className='card';
 
           if (v.images && v.images.length){
-            // slideshow card
-            c.innerHTML = `
-              <img src="${v.images[0]}"
-                   class="single-img"
-                   data-images='${JSON.stringify(v.images)}'
-                   data-aweme-id="${v.aweme_id}" />
-              <div class="title">${v.aweme_id}</div>
-            `;
+            // slideshow card - NO HD button
+            const thumb = document.createElement('img');
+            thumb.src = v.images[0];
+            thumb.className = 'single-img';
+            thumb.dataset.images = JSON.stringify(v.images || []);
+            thumb.dataset.awemeId = v.aweme_id || '';
+            thumb.dataset.username = username || '';
+            c.appendChild(thumb);
+            const title = document.createElement('div');
+            title.className = 'title';
+            title.textContent = v.aweme_id || '';
+            c.appendChild(title);
+
+            const btns = document.createElement('div');
+            btns.className = 'card-buttons';
+
+            // single-image download (first image)
+            const dlAnchor = document.createElement('a');
+            dlAnchor.href = v.images[0];
+            dlAnchor.setAttribute('download', '');
+            const dlBtn = document.createElement('button');
+            dlBtn.textContent = 'Download';
+            dlAnchor.appendChild(dlBtn);
+            btns.appendChild(dlAnchor);
+
+            // Download All images button (card-level)
+            const dlAllBtn = document.createElement('button');
+            dlAllBtn.textContent = 'Download All';
+            dlAllBtn.onclick = async () => {
+              // attempt zip
+              const imgs = JSON.parse(thumb.dataset.images || '[]');
+              if (!imgs.length) { alert('No images to download'); return; }
+              await downloadAllImagesAsZip(imgs, `${username || 'slideshow'}_${v.aweme_id || Date.now()}`);
+            };
+            btns.appendChild(dlAllBtn);
+
+            c.appendChild(btns);
           } else {
             // plain video
-            c.innerHTML = `
+            const vidHtml = document.createElement('div');
+            vidHtml.innerHTML = `
               <video controls data-aweme-id="${v.aweme_id}">
                 <source src="${v.play_url}" type="video/mp4">
               </video>
               <div class="title">${v.aweme_id}</div>
             `;
-          }
+            c.appendChild(vidHtml);
 
-          // Download + HD buttons
-          c.innerHTML += `
-            <div class="card-buttons">
-              <a href="/download?video_id=${v.aweme_id}&hd=0" download><button>Download</button></a>
-              <button class="hd-trigger" data-aweme="${v.aweme_id}" ${v.hd_url ? `data-hd="${v.hd_url}"` : ''}>HD</button>
-            </div>
-          `;
+            const btns = document.createElement('div');
+            btns.className = 'card-buttons';
+            const a = document.createElement('a');
+            a.href = `/download?video_id=${v.aweme_id}&hd=0`;
+            a.setAttribute('download', '');
+            const btn = document.createElement('button');
+            btn.textContent = 'Download';
+            a.appendChild(btn);
+            btns.appendChild(a);
+
+            // HD still available for videos
+            const hd = document.createElement('button');
+            hd.className = 'hd-trigger';
+            hd.dataset.aweme = v.aweme_id;
+            hd.textContent = 'HD';
+            btns.appendChild(hd);
+
+            c.appendChild(btns);
+          }
 
           grid.appendChild(c);
         });
@@ -1250,15 +1333,13 @@
       const src = currentTarget.querySelector('source') ? currentTarget.querySelector('source').src : currentTarget.src;
       window.open(src, '_blank');
     };
-    document.getElementById('menu-download-image').onclick = () => {
+    document.getElementById('menu-download-image').onclick = async () => {
       customMenu.style.display = 'none';
       const src = currentTarget.src;
-      const a = document.createElement('a');
-      a.href = src;
-      a.download = '';
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
+      // Try blob download first
+      const suggested = (currentTarget.dataset && currentTarget.dataset.awemeId) ? `${currentTarget.dataset.awemeId}.jpg` : '';
+      const ok = await downloadUrlAsFile(src, suggested);
+      if (!ok) fallbackDirectDownload(src, suggested);
     };
 
     // Image slideshow (modal + api open)
@@ -1269,6 +1350,7 @@
       const prevBtn  = imgModal.querySelector('.prev');
       const nextBtn  = imgModal.querySelector('.next');
       const downloadBtn = document.getElementById('modal-download');
+      const downloadAllBtn = document.getElementById('modal-download-all');
       let currentImages = [];
       let currentIndex = 0;
 
@@ -1299,18 +1381,24 @@
             if (!arr.length) return;
             currentImages = arr;
             currentIndex = 0;
+            // store metadata for suggested filenames
+            imgModal.dataset.username = img.dataset.username || '';
+            imgModal.dataset.aweme = img.dataset.awemeId || '';
             showModal();
           };
         });
       }
       bindSingleImages();
 
-      // expose openSlideshow(images, index)
-      window.openSlideshow = function(images, index){
+      // expose openSlideshow(images, index, metadata)
+      window.openSlideshow = function(images, index, metadata){
         try {
           if (!Array.isArray(images) || !images.length) return;
           currentImages = images;
           currentIndex = (typeof index === 'number' && index >= 0) ? (index % images.length) : 0;
+          // optional metadata
+          imgModal.dataset.username = (metadata && metadata.username) || imgModal.dataset.username || '';
+          imgModal.dataset.aweme = (metadata && metadata.aweme) || imgModal.dataset.aweme || '';
           showModal();
         } catch (e) {
           console.debug('openSlideshow error', e);
@@ -1320,21 +1408,116 @@
       closeBtn.onclick = closeModal;
       prevBtn.onclick  = showPrev;
       nextBtn.onclick  = showNext;
-      downloadBtn.onclick = () => {
+
+      downloadBtn.onclick = async () => {
         const src = modalImg.src;
-        const a = document.createElement('a');
-        a.href = src;
-        a.download = '';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
+        if (!src) { alert('No image to download'); return; }
+        const username = imgModal.dataset.username || '';
+        const aweme = imgModal.dataset.aweme || '';
+        // build suggested filename
+        const ext = (src.split('.').pop().split(/\#|\?/)[0] || 'jpg').substr(0,6);
+        const suggested = `${username || aweme || 'image'}_${currentIndex + 1}.${ext}`;
+        const ok = await downloadUrlAsFile(src, suggested);
+        if (!ok) {
+          fallbackDirectDownload(src, suggested);
+        }
       };
+
+      // download all: try zip via JSZip, fallback to individual downloads
+      downloadAllBtn.onclick = async () => {
+        const imgs = currentImages || [];
+        if (!imgs.length) { alert('No images to download'); return; }
+        const username = imgModal.dataset.username || '';
+        const aweme = imgModal.dataset.aweme || '';
+        await downloadAllImagesAsZip(imgs, `${username || aweme || 'slideshow'}_${Date.now()}`);
+      };
+
       imgModal.onclick = e => {
         if (e.target === imgModal) closeModal();
       };
 
       window.addEventListener('slideshowRendered', bindSingleImages);
     })();
+
+    // helper: download multiple images as ZIP (tries to fetch blobs, uses JSZip)
+    async function downloadAllImagesAsZip(imageUrls, zipNameBase) {
+      if (!imageUrls || !imageUrls.length) return;
+      const zipName = `${zipNameBase || 'images'}_${(new Date()).toISOString().replace(/[:.]/g,'-')}.zip`;
+      // If JSZip not available, fallback to sequential download
+      if (typeof JSZip === 'undefined') {
+        // fallback: attempt individual downloads
+        for (let i = 0; i < imageUrls.length; i++) {
+          const u = imageUrls[i];
+          const ext = (u.split('.').pop().split(/\#|\?/)[0] || 'jpg').substr(0,6);
+          const fname = `${zipNameBase || 'images'}_${i+1}.${ext}`;
+          const ok = await downloadUrlAsFile(u, fname);
+          if (!ok) fallbackDirectDownload(u, fname);
+          // small delay to avoid overwhelming
+          await new Promise(r => setTimeout(r, 200));
+        }
+        return;
+      }
+
+      try {
+        const zip = new JSZip();
+        let failures = [];
+        for (let i = 0; i < imageUrls.length; i++) {
+          const url = imageUrls[i];
+          try {
+            const res = await fetch(url, {mode: 'cors'});
+            if (!res.ok) throw new Error('Fetch failed ' + res.status);
+            const blob = await res.blob();
+            // guess extension
+            let ext = 'jpg';
+            const ct = blob.type || '';
+            if (ct && ct.includes('/')) ext = ct.split('/')[1].split(';')[0] || ext;
+            const filename = `${zipNameBase || 'img'}_${i+1}.${ext}`;
+            zip.file(filename, blob);
+          } catch (err) {
+            console.debug('Failed fetch image for zip', url, err);
+            failures.push(url);
+          }
+        }
+
+        if (zip && Object.keys(zip.files).length > 0) {
+          const content = await zip.generateAsync({type:"blob"});
+          // download the zip
+          const blobUrl = URL.createObjectURL(content);
+          const a = document.createElement('a');
+          a.href = blobUrl;
+          a.download = zipName;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(blobUrl);
+        }
+
+        // If there were failures, attempt individual downloads for those
+        if (failures.length) {
+          alert(`${failures.length} image(s) couldn't be fetched due to CORS or network. Attempting direct downloads for those.`)
+          for (let j = 0; j < failures.length; j++) {
+            const u = failures[j];
+            const ext = (u.split('.').pop().split(/\#|\?/)[0] || 'jpg').substr(0,6);
+            const fname = `${zipNameBase || 'images'}_failed_${j+1}.${ext}`;
+            const ok = await downloadUrlAsFile(u, fname);
+            if (!ok) fallbackDirectDownload(u, fname);
+            await new Promise(r => setTimeout(r, 200));
+          }
+        }
+
+      } catch (e) {
+        console.debug('downloadAllImagesAsZip error; falling back to individual downloads', e);
+        // fallback to individual
+        for (let i = 0; i < imageUrls.length; i++) {
+          const u = imageUrls[i];
+          const ext = (u.split('.').pop().split(/\#|\?/)[0] || 'jpg').substr(0,6);
+          const fname = `${zipNameBase || 'images'}_${i+1}.${ext}`;
+          const ok = await downloadUrlAsFile(u, fname);
+          if (!ok) fallbackDirectDownload(u, fname);
+          await new Promise(r => setTimeout(r, 200));
+        }
+      }
+    }
 
     // Video placeholder -> create video element and lazy-load source
     document.body.addEventListener('click', async (e) => {
@@ -1419,7 +1602,7 @@
       });
     }
 
-    // Slideshow functions (kept unchanged from previous robust version)
+    // Slideshow functions (modified to remove HD from image cards and add download-all)
     async function fetchSlides(){
       try {
         const res = await fetch('/api/slideshow');
@@ -1484,39 +1667,51 @@
         card.appendChild(info);
         const btns = document.createElement('div');
         btns.className = 'card-buttons';
+
+        // Download (single) — for image slideshows point to first image and force download
         const dlAnchor = document.createElement('a');
-        dlAnchor.href = v.play_url || '#';
-        if (v.play_url) dlAnchor.setAttribute('download', '');
+        if (v.images && v.images.length) {
+          dlAnchor.href = v.images[0];
+          dlAnchor.setAttribute('download','');
+        } else if (v.play_url) {
+          dlAnchor.href = v.play_url;
+          dlAnchor.setAttribute('download','');
+        } else {
+          dlAnchor.href = '#';
+        }
         const dlBtn = document.createElement('button');
         dlBtn.textContent = 'Download';
-        if (!v.play_url) dlBtn.disabled = true;
         dlAnchor.appendChild(dlBtn);
         btns.appendChild(dlAnchor);
 
-        // HD: render as button that will either use pre-existing HD url (data-hd) or call server submit
-        const hdBtn = document.createElement('button');
-        hdBtn.textContent = 'HD';
-        hdBtn.className = 'hd-trigger';
-        hdBtn.dataset.aweme = v.aweme_id || '';
-        if (v.hd_url) hdBtn.dataset.hd = v.hd_url;
-        if (!v.hd_url && !v.play_url) hdBtn.disabled = true;
-        btns.appendChild(hdBtn);
+        // Download All (card-level) - zips all images
+        const dlAllBtn = document.createElement('button');
+        dlAllBtn.textContent = 'Download All';
+        dlAllBtn.onclick = async () => {
+          const imgs = v.images || (v.play_url ? [v.play_url] : []);
+          if (!imgs.length) { alert('No images to download'); return; }
+          await downloadAllImagesAsZip(imgs, `${(v.username||'slideshow')}_${v.aweme_id || Date.now()}`);
+        };
+        btns.appendChild(dlAllBtn);
 
+        // View button (opens modal)
         const viewBtn = document.createElement('button');
         viewBtn.textContent = 'View';
         viewBtn.onclick = () => {
-          const imgs = JSON.parse(img.dataset.images || '[]');
-          if (!imgs || !imgs.length) {
+          const imgsArr = JSON.parse(img.dataset.images || '[]');
+          if (!imgsArr || !imgsArr.length) {
             alert('No images in this slideshow');
             return;
           }
           if (window.openSlideshow) {
-            window.openSlideshow(imgs, 0);
+            window.openSlideshow(imgsArr, 0, { username: img.dataset.username || '', aweme: img.dataset.awemeId || '' });
           } else {
             img.click();
           }
         };
         btns.appendChild(viewBtn);
+
+        // NOTE: Removed HD button for image slideshow cards on purpose per request
         card.appendChild(btns);
         grid.appendChild(card);
       });
@@ -1562,21 +1757,17 @@
     btnShowAll.onclick = () => setImagesOnlyMode(false);
 
     // -------- HD handling logic (ONLY uses submit task via /api/from-url; no fallback) --------
-    // helper: start a same-origin download by loading your server's /download endpoint in a hidden iframe.
-    // This avoids opening a new tab and relies on your /download endpoint's Content-Disposition header.
     function startProxyDownload(aweme) {
       try {
         const iframe = document.createElement('iframe');
         iframe.style.display = 'none';
         iframe.src = `/download?video_id=${encodeURIComponent(aweme)}&hd=1`;
-        // Append then remove later to allow the browser to initiate the download without navigation.
         document.body.appendChild(iframe);
         setTimeout(() => {
           try { document.body.removeChild(iframe); } catch (e) {}
-        }, 60 * 1000); // remove after 60s
+        }, 60 * 1000);
       } catch (e) {
         console.debug('startProxyDownload error', e);
-        // fallback: open in new tab (last resort)
         window.open(`/download?video_id=${encodeURIComponent(aweme)}&hd=1`, '_blank');
       }
     }
@@ -1588,9 +1779,6 @@
         alert('Missing aweme id');
         return;
       }
-
-      // If we already have hd_url on the button (from saved data), don't hit third-party directly:
-      // call your server /download proxy so browser receives correct Content-Disposition and we avoid audio-only direct links.
       if (button.dataset.hd) {
         button.disabled = true;
         const orig = button.textContent;
@@ -1608,7 +1796,6 @@
         return;
       }
 
-      // Otherwise we MUST use submit task via POST /api/from-url and wait for server to provide HD (server stores it into HD_URLS)
       button.disabled = true;
       const origText = button.textContent;
       button.textContent = 'Downloading HD — 1 moment';
@@ -1631,15 +1818,11 @@
 
           if (!res.ok) {
             console.debug('from-url attempt', attempt, 'status', res.status);
-            // retry if attempts remain
           } else {
             const body = await res.json().catch(()=>({}));
-            // server returns hd_url if submit_tikwm_task succeeded
             const hd = body.hd_url || body.play_url || '';
             if (hd) {
-              // store for future and trigger download via your server proxy (not direct third-party URL)
               button.dataset.hd = hd;
-              // Important: use your server's /download proxy so browser receives the attachment
               startProxyDownload(aweme);
               button.removeChild(spinner);
               button.textContent = origText;
@@ -1653,13 +1836,11 @@
           console.debug('from-url attempt error', attempt, err);
         }
 
-        // If not last attempt, wait a bit and retry
         if (attempt < maxAttempts) {
           await new Promise(res => setTimeout(res, 2000));
         }
       }
 
-      // exhausted attempts — show failure (NO fallback to /download)
       button.removeChild(spinner);
       button.textContent = origText;
       button.disabled = false;
