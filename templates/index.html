@@ -854,7 +854,7 @@
     // delete-user & delete-url
     function bindDeleteUsers(){
       document.querySelectorAll('.delete-user').forEach(b=>{
-        b.onclick = async ()=>{
+        b.onclick = async ()=> {
           if (!confirm(`Delete user ${b.dataset.username}?`)) return;
           const r = await fetch(`/api/saved-users/${encodeURIComponent(b.dataset.username)}`,{method:'DELETE'});
           if (r.ok) b.closest('.user-entry').remove();
@@ -864,7 +864,7 @@
     }
     function bindDeleteUrls(){
       document.querySelectorAll('.delete-url').forEach(b=>{
-        b.onclick = async ()=>{
+        b.onclick = async ()=> {
           if (!confirm(`Delete saved URL ${b.dataset.aweme}?`)) return;
           const r = await fetch(`/api/saved-urls/${encodeURIComponent(b.dataset.aweme)}`,{method:'DELETE'});
           if (r.ok) b.closest('.card').remove();
@@ -1000,21 +1000,55 @@
       }
     }
 
-    // Fetch & render saved URLs
+    // Fetch & render saved URLs — show ONLY URLs that were inputted manually (no username/user)
     async function fetchSavedUrls(){
-      const res   = await fetch('/api/saved-urls'),
-            saved = await res.json();
-      renderUrlSection(saved);
+      try {
+        const res = await fetch('/api/saved-urls');
+        const savedRaw = (res.ok) ? await res.json() : [];
+        // Keep only items that don't have a username/user (i.e. manual URL inputs)
+        const saved = Array.isArray(savedRaw)
+          ? savedRaw.filter(v => {
+              // treat empty-string or null as "no username"
+              const uname = v && (v.username || v.user);
+              return !(typeof uname === 'string' ? uname.trim().length > 0 : !!uname);
+            })
+          : [];
+        const filteredOutCount = Array.isArray(savedRaw) ? (savedRaw.length - saved.length) : 0;
+        renderUrlSection(saved, filteredOutCount);
+      } catch (err) {
+        console.debug('fetchSavedUrls error', err);
+        renderUrlSection([], 0);
+      }
     }
-    function renderUrlSection(savedUrls){
+
+    function renderUrlSection(savedUrls, filteredOutCount = 0){
       const sec = document.getElementById('url-section'),
             g   = document.getElementById('url-grid');
-      if (!savedUrls.length){
+
+      if (!Array.isArray(savedUrls) || !savedUrls.length){
         sec.style.display='none';
         return;
       }
+
       sec.style.display='block';
       g.innerHTML='';
+
+      // optional small info banner about filtered entries
+      let info = document.getElementById('url-filter-info');
+      if (!info) {
+        info = document.createElement('div');
+        info.id = 'url-filter-info';
+        info.style.textAlign = 'center';
+        info.style.color = '#aaa';
+        info.style.margin = '8px 0 12px 0';
+        sec.insertBefore(info, g);
+      }
+      if (filteredOutCount > 0) {
+        info.textContent = `${filteredOutCount} item(s) filtered out (these came from saved users). Showing only manually-entered URLs.`;
+      } else {
+        info.textContent = '';
+      }
+
       savedUrls.forEach(v=>{
         const card = document.createElement('div');
         card.className='card';
@@ -1035,6 +1069,7 @@
           </button>`;
         g.appendChild(card);
       });
+
       bindDeleteUrls();
     }
 
